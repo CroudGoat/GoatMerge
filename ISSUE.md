@@ -1,127 +1,130 @@
-# Mergekit Task Arithmetic マージ — 課題と改善案
+# GoatMerge — 課題・実装状況・将来展望
 
-対象: mergekit (GitHub main, v0.1.4, `/home/CloudGoat/venvs/mergekit`) の Task Arithmetic (GTA) マージパス。
+## 1. 元の問題（mergekit GTA）
+
+mergekit (v0.1.4) の Task Arithmetic (GTA) マージパスの問題点：
+
+- `torch.stack` で全 delta を (k, shape) に積み上げる → ピーク ≈ (4k+4)S ～ (6k+7)S
+- 全 `argsort` の O(N log N) + N·4B インデックスアロケーション
+- loaded tensor の滞留（Executor `values` 辞書）
+- dtype 変換のコピー
+- 9B bf16（S≈110MB, k=4）でピーク ≈ 2.2–4 GB
+- 400B 級（S≈1.7GB, k=4）で ≈ 34–53 GB → 単一 GPU で不可行
+
 参照実装:
 - カーネル: `mergekit/merge_methods/generalized_task_arithmetic.py`
 - スパース化: `mergekit/sparsify.py`
 - ストリーミング実証例: `Smart-Task-Arithmetic/taskvector/merge.py`
-- 同型問題を持つCABSカーネル: `mergekit-cabs/mergekit_cabs/methods.py`
 
-## 1. 現行の実態
+## 2. GoatMerge の実装（完了）
 
-Tensorごとのパイプライン:
-
-1. `GatherTensors` がそのtensorの **全モデル (k+1) のテンソルを同時にロード**
-2. `GTATask.execute` が各モデルについて `delta = W_i − W_base` を計算
-3. 各deltaを `sparsify`（magnitude / magnitude_outliers / della_magprune）
-4. **`torch.stack` で全deltaを (k, shape) に積み上げ** → 重み乗算 → consensus mask（sign/majority）→ sum → normalize → `base + mixed`
-
-## 2. 課題（メモリ・効率の具体点）
-
-### 2.1 `torch.stack` による全delta同時materialization（最大のメモリ消費）
-
-1 tensorあたりのピーク（S = tensorサイズ, k = fine-tuned数）:
-
-| 要素 | 量 |
-|---|---|
-| loaded tensors（Executorの`values`にマージ完了まで残存） | (k+1)·S |
-| deltas | k·S |
-| `torch.stack` | k·S |
-| `weighted_deltas` | k·S |
-| consensus mask（`sign` + `sign_weight` + bool mask） | ≈(2k+3)·S |
-| `mixed` / `divisor` / 結果 | 3·S |
-
-**合計 ≈ (4k+4)·S（consensusなし）～ (6k+7)·S（consensusあり）**、さらにsparsify中のtemp（`abs`コピー + 全`argsort`インデックス N·4B + mask + masked）が **deltaあたり ≈ 4S + N·4B** 追加。
-
-- 9B bf16（最大tensor ≈110MB, k=4）: **ピーク ≈ 2.2〜4 GB**
-- 400B級（最大tensor ≈1.7GB, k=4）: **≈ 34〜53 GB** → 単一GPUで不可行
-
-### 2.2 全`argsort`のO(N log N)と巨大インデックスアロケーション
-
-`magnitude`/`magnitude_outliers` は `torch.argsort` で **全N要素のインデックス (N·4B)** をmaterialize。N=45Mで180MB、densityが小さいほど無駄が大きい。CPUではbf16→f32のアップキャストでabs tempが2倍に。
-
-### 2.3 loaded tensorの滞留
-
-`get_task_vectors` はローカルで `del tensors[model]` するが、Executorの `values` 辞書は LoadTensor の結果を **マージ完了まで保持**（`last_use_index` によるevictionはGTATask完了後）。計算中に「loaded + delta」が二重で同居。
-
-### 2.4 dtype変換のコピー
-
-`x = tensors[model].to(base.dtype)` — sourceがF32・baseがBF16等の場合、全Sのコピー。
-
-### 2.5 意味論的注意点（軽微だが実害あり）
-
-- `divisor[divisor == 0] = 1` — 重み同定で0の位置を静かに1除算に置換
-- size不一致tensorは警告のみで**静かにスキップ**（マージの欠落が検知しにくい）
-- embedはサブマトリックス切り取りで警告のみ
-
-## 3. 改善案（効率化・省メモリ化）
-
-### A. ストリーミング累加（`torch.stack` 廃止）— 最大の効果
+### 2.1 ストリーミング累加（`torch.stack` 廃止）
 
 ```python
 acc = base.clone()
-for i in models:
-    delta = load(model).clone().sub_(base)   # in-place
-    delta = sparsify_inplace(delta)
-    acc.add_(delta, alpha=weight_i)        # in-place
+for i in range(k):
+    delta = load(tv_i).clone()
+    delta = sparsify(delta)          # コンセンサス前
+    w = torch.tensor(alpha_i, dtype=delta.dtype)
+    delta.mul_(w)                    # bf16·bf16 テンソル積（parity 重要）
+    acc.add_(delta)                  # in-place
+    l1.add_(delta.abs())
     # delta は即解放
 ```
 
-- ピーク: **base + acc + 1 delta + sparsify temp ≈ 5S**（k=4, S=110MBで **≈550MB**）→ 現行比で **4〜7倍削減**
-- consensus（TIES）もstack不要で実装可能:
-  - **Pass 1**: `acc = Σ αᵢδᵢ`（in-place）+ 位置ごとの符号カウント `cnt`（int8, **S bytes**）
-  - majority = `sign(acc)`（sum法）または `sign(cnt)`（count法）
-  - **Pass 2**: 各TVをディスクから再読し、符号一致位置のみ `acc.add_(αᵢδᵢ·mask)`
-- これは既存の **Smart-Task-Arithmetic（`taskvector`）** が実証済みの方式（9B+4TVで ~0.4GB vs load-all ~90GB）。**ギャップ: sparsify/consensus/normalize未統合** → ここに統合する。
+- ピーク: **1.06 S**（実測、100 MB bf16、2 TV、consensus=sum）
+- 9B 級（S≈1.8GB/層）で層あたり ≈ 2–4 GB
 
-### B. タスクベクトル(TV)の事前抽出・再利用
+### 2.2 コンセンサス恒等式
 
-- `T_i = W_i − W_base` を**1回だけ**safetensorsに保存し、以降のマージはTVをストリーム
-- λ/consensus/sparsifyの再実験（AWA探索、RoMMルーティング反復）でsource modelを再読不要 → I/O削減
-- コスト: ディスク k×model size（sequential readで安価）
+```
+mixed = (acc + M · l1) / 2,   M = sign(majority) = ±1
+divisor[divisor == 0] = 1
+result = (base + mixed).to(base.dtype)
+```
 
-### C. `topk` で全`argsort`を置換
+- 全 delta のマスク積を 2 回の in-place `add_`/`mul_` に置き換え
+- int8 符号カウンタ（count 方式）
 
-- `torch.topk(w, k)` はインデックス **k個のみ**（N·4B → k·4B）、O(N log k)
-- N=45M, density=0.1: 180MB → 18MB（10倍）、density=0.5: 180MB → 90MB
-- `magnitude_outliers` は top-γ と bottom-(1−d−γ) の2回partial selectionで同型化
+### 2.3 数値パリティ
 
-### D. BS（n:m ブロック）剪定をGATカーネルに追加
+- 重み付き積 `δᵢ · αᵢ` は **bf16·bf16 テンソル積**（`stacked · weights` と一致）
+- `add_(alpha=scalar)` では内部積精度が近接要素で乖離 → 多数決符号反転
+- rtol=2e-2, atol=1e-2 で mergekit GTA と一致（43 テスト）
 
-- ブロックごとの `blocks.topk(n, dim=1)` — 全N sort不要、O(N log m)、アロケは N·(n/m)·4B のみ
-- CABS系スパース化をGATに統合し、グローバルsortを回避（mergekit-cabsのカーネルも同じstack問題を持つため共通有効）
+### 2.4 スパルシファイ
 
-### E. in-place化と即解放
+- **コンセンサス前に**各 delta へ適用
+- `torch.topk`（`argsort` ではなく）— インデックス k 個のみ
+- bf16/fp16 は f32 へ幅広げて topk（CPU）
+- 方式: `l1`, `l2`, `gamma`, BS（n:m ブロック）
 
-- `x.sub_(base)`（clone後）、`delta *= mask`、`acc.add_(t, alpha)` — 全tempのコピーを削減
-- **LoadTensorの即消費**（per-model delta task化）で `values` 滞留を解消 → loaded tensorは1個ずつのみ
+### 2.5 TV 事前抽出・再利用
 
-### F. int8 mask / 符号カウンタの圧縮
+- `extract_task_vector`: `T = W_source − W_base` を safetensors に保存
+- 以降のマージは TV をストリーム（source model 再読不要）
+- 指紋検証: ベース fingerprint が一致するかチェック
 
-- consensus maskを既定int8（1B/要素）→ bf16比 ½、f32比 ¼
-- 符号カウントはint8（S bytes）で保持
+### 2.6 HF シャード型 safetensors I/O
 
-### G. 大tensorのチャンク分割処理
+- `model.safetensors.index.json` + `model-XXXXX-of-NNNNN.safetensors`
+- 単一シャード → `model.safetensors`
+- 同時に 1 テンソルのみ常駐
 
-- 1 tensorを64〜256MBチャンクに分割し逐次処理 → **ピークをチャンクサイズで上限設定**（400B級でも24〜48GB GPUで実行可）
-- 注意: global magnitude剪定はチャンク局所でない → 2 pass（quantile閾値算出→適用）またはBS剪定（チャンク局所以来）と組み合わせる（RoMMの `--chunk-elements` と同思想）
+### 2.7 CLI + YAML レシピ
 
-### H. 多GPUへのチャンク分配
+- `goatmerge extract` / `goatmerge merge` / `goatmerge inspect`
+- `goatmerge merge -c recipe.yaml` で YAML からパラメータ読み込み
+- CLI フラグは YAML 値を上書き
 
-- チャンク単位でGPU間分配 → per-GPUピーク = チャンク+acc（現行はtensor単位islandで1.7GB×(4k+4)がVRAM超過し得る）
+### 2.8 メタデータエンベローブ
 
-### I. CPUアップキャスト回避
+- マージ結果に `metadata.json`（base、TV 一覧、settings、fingerprint）
+- `inspect` で確認可能
 
-- CPUでbf16 topkを許容（`torch.topk`はbf16対応）→ f32 temp（2S）を削減
+## 3. 残課題・将来展望
 
-## 4. 優先順位（効果/工数比）
+| # | 課題 | 現状 | 目標 |
+|---|---|---|---|
+| 1 | 大 tensor のチャンク分割 | `--chunk-elements` あり（未実装テスト） | 400B 級を 24–48 GB GPU で実行可 |
+| 2 | 多 GPU 分配 | 未 | チャンク単位で GPU 間分配 |
+| 3 | GPU カーネル | CPU 専用 | CUDA 対応（`torch` GPU 経路） |
+| 4 | 大規模 AWA 探索 | 未 | λ/consensus/sparsify の自動探索 |
+| 5 | RoMM ルーティング | 未 | 複数ベース間ルーティング |
+| 6 | CABS 統合 | 未 | BS 剪定を GAT に統合（一部実装済み） |
+| 7 | 並列 TV 抽出 | 未 | k 個 TV を並列抽出 |
 
-| # | 改善 | 効果 |
-|---|---|---|
-| 1 | ストリーミング累加（stack廃止）+ 2-pass consensus | ピーク (4k+4)S → ~5S（k=4で4〜7倍） |
-| 2 | TV事前抽出・再利用 | 再実験I/Oほぼゼロ、ストリーム前提 |
-| 3 | in-place化 + loaded即解放 | temp 2〜3S削減 |
-| 4 | topk置換 | sort時間・インデックスメモリ大幅減 |
-| 5 | BS剪定追加 | 全局sort回避、CABS統合 |
-| 6 | int8 mask | maskメモリ ½〜¼ |
-| 7 | チャンク分割 + 多GPU分配 | 70B〜400Bを実行可能に |
+## 4. ファイル構成（現状）
+
+```
+goatmerge/
+  __init__.py      # パッケージ
+  cli.py            # CLI（extract/merge/inspect + YAML -c）
+  consensus.py      # ConsensusAccumulator（ストリーミングカーネル）
+  extract.py        # TV 抽出
+  fingerprint.py    # 指紋検証
+  hf.py             # HF モデルディレクトリ解決
+  inspect.py        # モデル検査
+  io.py              # ShardReader, TensorWriter, ShardedTensorIndex
+  merge.py            # merge_model, merge_tensor
+  metadata.py         # メタデータエンベローブ
+  sparsify.py         # スパルシファイカーネル
+tests/
+  test_consensus_merge.py   # パリティ + マージ
+  test_fingerprint.py
+  test_io.py
+  test_metadata.py
+  test_sparsify.py
+  measure_peak_ram.py
+examples/
+  merge_recipe.yaml   # YAML レシピ例
+AGENTS.md             # プロジェクトガイド（gitignore）
+ambition.md           # 野心記録（gitignore）
+```
+
+## 5. 環境
+
+- ワークスペース: `/home/CloudGoat/llms_merge/GoatMerge`
+- インタープリタ: `/home/CloudGoat/venvs/mergekit/bin/python`
+- 依存: Python ≥ 3.10, PyTorch, `safetensors`, `pyyaml`
+- Git: `CroudGoat/GoatMerge`（private, master）
