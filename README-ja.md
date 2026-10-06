@@ -4,7 +4,7 @@
 （タスクベクトル）をベースモデルにマージします。
 
 - **`torch.stack` 不使用** — 各 delta を1つずつストリーミング
-- **峰值 RAM ≈ 5–7 S**（S = 最大テンソルバイト数）
+- **ピーク RAM ≈ 5–7 S**（S = 最大テンソルバイト数）
 - **mergekit GTA（Generalized Task Arithmetic）との数値パリティ**
 
 ## 主な特性
@@ -12,7 +12,7 @@
 | 項目 | GoatMerge | mergekit GTA |
 |---|---|---|
 | 全 delta をスタック？ | しない — 1つずつストリーミング | する（`torch.stack`） |
-| 峰值 RAM（k 個 TV、1 テンソル） | ≈ 5–7 S | (4k+4) S – (6k+7) S |
+| ピーク RAM（k 個 TV、1 テンソル） | ≈ 5–7 S | (4k+4) S – (6k+7) S |
 | コンセンサス（マスク和） | 厳密恒等式 `(acc + M·l1)/2` | `stacked · weights` 後にマスク |
 | スパルシファイ | コンセンサス前に各 delta へ | コンセンサス前 |
 | I/O | HF シャード型 safetensors | HF シャード型 safetensors |
@@ -53,7 +53,7 @@ goatmerge extract \
 | `--weight` | 1.0 | 各エントリのマージ重み |
 | `--out` | （必須） | 出力ディレクトリ |
 | `--consensus` | `none` | `none` \| `sum` \| `count` |
-| `--normalize` | true | 要素毎の除数で割る |
+| `--normalize` | true | 要素ごとの除数で割る |
 | `--lambda` | 1.0 | ミックステンソルの倍率 |
 | `--density` | 1.0 | スパルシファイ密度（0 = スキップ） |
 | `--method` | （なし） | スパルシファイ方式: `l1` \| `l2` \| `gamma` |
@@ -76,8 +76,8 @@ c    = Σᵢ sign(αᵢ·δᵢ)   （int8, count 方式のみ）
 ```
 
 重み付き積 `δᵢ · αᵢ` は **bf16·bf16 テンソル積**（参照の `stacked · weights`
-と一致）であり、Python フロート標量 `add_` ではありません — 後者の内部積
-精度は近接要素で乖離し、要素毎の多数決符号を反転させます。
+と一致）であり、Python のスカラー `add_` ではありません — 後者の内部積
+精度は近接要素で乖離し、要素ごとの多数決符号を反転させます。
 
 ### コンセンサス恒等式
 
@@ -86,7 +86,7 @@ mixed = (acc + M · l1) / 2,   M = (acc|c) ≥ 0 なら +1、さもなくば −
 ```
 
 ゼロは両形式で 0 に寄与し、参照のマスク（符号 0 要素を除外）と一致します。
-`divisor`（符号一致 TV の要素毎重み和）のみ第 2 ストリーミングパスを
+`divisor`（符号一致 TV の要素ごと重み和）のみ第 2 ストリーミングパスを
 必要とします。
 
 ### スパルシファイ
@@ -98,16 +98,16 @@ mixed = (acc + M · l1) / 2,   M = (acc|c) ≥ 0 なら +1、さもなくば −
 
 HF シャード型 safetensors 配置（`model.safetensors.index.json` +
 `model-XXXXX-of-NNNNN.safetensors`）。単一シャード → `model.safetensors`。
-同時に1つのテンソルのみresident；`get_tensor` はシャードのキャッシュ
+同時に1つのテンソルのみ常駐；`get_tensor` はシャードのキャッシュ
 コピーと共有ストレージのビューを返します — 変更前に `.clone()` が必要です。
 
-## 峰值 RAM
+## ピーク RAM
 
 合成 100 MB bf16 テンソル（2 TV、consensus=sum）での実測：
 
 ```
 S (最大テンソル):  100.0 MB
-マージ峰值 RSS:    105.6 MB
+マージピーク RSS:    105.6 MB
 Peak / S:          1.06  （目標: 5–7）
 ```
 
@@ -125,7 +125,7 @@ python -m pytest tests/ -v
 - ストリーミングマージ（コンセンサスなし、consensus sum/count）
 - スパルシファイ（l1, l2, gamma, top-k）
 - 指紋検証
-- I/O（シャード型、単一シャード、サブ行列截断）
+- I/O（シャード型、単一シャード、サブ行列切り詰め）
 - メタデータエンベローブ
 - mergekit GTA との数値パリティ（rtol=2e-2, atol=1e-2）
 
@@ -150,5 +150,5 @@ tests/
   test_io.py
   test_metadata.py
   test_sparsify.py
-  measure_peak_ram.py       # 峰值 RAM 計測
+  measure_peak_ram.py       # ピーク RAM 計測
 ```
