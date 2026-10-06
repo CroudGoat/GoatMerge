@@ -17,6 +17,45 @@
 | スパルシファイ | コンセンサス前に各 delta へ | コンセンサス前 |
 | I/O | HF シャード型 safetensors | HF シャード型 safetensors |
 
+## mergekit との比較
+
+### メモリ（実測、100 MB bf16 テンソル、2 TV、consensus=sum）
+
+| | GoatMerge | mergekit GTA（理論値） |
+|---|---|---|
+| ピーク RSS | **105.6 MB**（1.06 × S） | **1.2 – 1.9 GB**（12 S – 19 S） |
+| スタック済みテンソル | 物化しない | `k × S`（k=2 で 200 MB） |
+| 各 delta の一時テンソル | 1 個ずつ（100 MB） | k 個全部 resident（200 MB） |
+| 蓄積簿 | acc + l1 + c = 2.5 S | stacked + weighted + mask ≈ 3 S |
+
+9B 級モデル（層あたり S ≈ 1.8 GB）では、GoatMerge は層あたり
+≈ 2–4 GB、mergekit は ≈ 22–34 GB。
+
+### 速度
+
+GoatMerge は各 delta をパスにつき1回だけストリームし、in place で
+蓄積します。`torch.stack` の割当、`stacked · weights` の全テンソル積、
+マスクのための全 delta 第 2 パスがありません。第 2 パスは要素毎
+`divisor`（コンセンサスのみ）で、各 delta の `add_` 1 回だけです。
+
+| 操作 | GoatMerge | mergekit GTA |
+|---|---|---|
+| k 個 delta の読み込み | k × (1 load) | k × (1 load) + 1 stack |
+| 重み付き和 | k × (in-place `add_`) | 1 × (full `stacked · weights`) |
+| マスク（コンセンサス） | in-place 恒等式 | 1 × (full mask multiply) |
+| 除数 | k × (in-place `add_`) | 1 × (full `weights · mask`) |
+
+in-place 蓄積は `torch.stack` + `stacked · weights` に必要な O(k·S)
+の一時割当を回避し、コンセンサス恒等式 `(acc + M·l1)/2` は全テンソル
+マスク積を 2 回の in-place `add_`/`mul_` に置き換えます。
+
+### 数値パリティ
+
+GoatMerge は bf16 テンソルで mergekit GTA と **rtol = 2e-2、atol = 1e-2**
+の範囲で一致します。重み付き積 `δᵢ · αᵢ` は bf16·bf16 テンソル積
+（参照の `stacked · weights` と一致）であり、Python フロート標量
+`add_` ではありません — 後者の内部積精度は近接要素で乖離します。
+
 ## インストール
 
 ```bash

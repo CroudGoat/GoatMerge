@@ -19,6 +19,48 @@ Arithmetic (GTA).
 | Sparsify | Before consensus (per delta) | Before consensus |
 | I/O | HF-sharded safetensors | HF-sharded safetensors |
 
+## Comparison with mergekit
+
+### Memory (measured, 100 MB bf16 tensor, 2 TVs, consensus=sum)
+
+| | GoatMerge | mergekit GTA (theoretical) |
+|---|---|---|
+| Peak RSS | **105.6 MB** (1.06 × S) | **1.2 – 1.9 GB** (12 S – 19 S) |
+| Stacked tensor | Never materialized | `k × S` (200 MB for k=2) |
+| Per-delta temporaries | 1 delta at a time (100 MB) | All k deltas resident (200 MB) |
+| Accumulator bookkeeping | acc + l1 + c = 2.5 S | stacked + weighted + mask ≈ 3 S |
+
+For a 9 B-class model (S ≈ 1.8 GB per layer), GoatMerge peaks at
+≈ 2–4 GB per layer; mergekit peaks at ≈ 22–34 GB.
+
+### Speed
+
+GoatMerge streams each delta exactly once per pass and accumulates in place.
+There is no `torch.stack` allocation, no `stacked · weights` full-tensor
+multiply, and no second pass over all k deltas for the mask. The only
+second pass is the per-element `divisor` (consensus only), which is a
+single `add_` per delta.
+
+| Operation | GoatMerge | mergekit GTA |
+|---|---|---|
+| Load k deltas | k × (1 load) | k × (1 load) + 1 stack |
+| Weighted sum | k × (in-place `add_`) | 1 × (full `stacked · weights`) |
+| Mask (consensus) | in-place identity | 1 × (full mask multiply) |
+| Divisor | k × (in-place `add_`) | 1 × (full `weights · mask`) |
+
+The in-place accumulation avoids the O(k·S) temporary allocation that
+`torch.stack` + `stacked · weights` requires, and the consensus identity
+`(acc + M·l1)/2` replaces a full-tensor mask multiply with two in-place
+`add_`/`mul_` operations.
+
+### Numerical parity
+
+GoatMerge matches mergekit GTA within **rtol = 2e-2, atol = 1e-2** on
+bf16 tensors. The weighted product `δᵢ · αᵢ` is a bf16·bf16 tensor
+multiply (matching the reference `stacked · weights`), not a Python-float
+scalar `add_` — whose internal product precision diverges at near-tie
+elements.
+
 ## Installation
 
 ```bash
