@@ -1,0 +1,18 @@
+[project]
+name = "goatmerge"
+version = "0.1.0"
+description = "Streaming task-arithmetic merge engine (no torch.stack, O(1 tensor + accumulator + 1 task vector) RAM)"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.1",
+    "safetensors>=0.4",
+]
+
+[project.scripts]
+goatmerge = "goatmerge.cli:main"
+
+[build-system]
+requires = ["setuptools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
