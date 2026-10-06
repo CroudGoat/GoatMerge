@@ -1,5 +1,7 @@
 # GoatMerge
 
+![GoatMerge](GoatMerge.png)
+
 [日本語版はこちら](README-ja.md)
 
 Streaming task-arithmetic merge engine. Merges fine-tuned models (task vectors)
