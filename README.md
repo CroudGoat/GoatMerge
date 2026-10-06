@@ -1,5 +1,7 @@
 # GoatMerge
 
+[日本語版はこちら](README-ja.md)
+
 Streaming task-arithmetic merge engine. Merges fine-tuned models (task vectors)
 into a base model with **no `torch.stack`**, peak RAM ≈ **5–7 S** (S = largest
 tensor bytes), and **numerical parity** with mergekit's Generalized Task
