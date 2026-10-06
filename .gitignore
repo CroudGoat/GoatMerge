@@ -7,3 +7,4 @@ build/
 .eggs/
 .pytest_cache/
 __pycache__/
+ambition.md
