@@ -1,0 +1,33 @@
+# GoatMerge YAML recipe example
+#
+# Usage: goatmerge merge -c examples/merge_recipe.yaml
+#
+# All CLI flags override values in this file.
+# Only fields you want to set need to appear here.
+
+base: /path/to/base-model
+out: /path/to/merged-output
+
+tv:
+  - dir: /path/to/tv1
+    weight: 0.7
+  - dir: /path/to/tv2
+    weight: 0.3
+
+# model:
+#   - dir: /path/to/source-model
+#     weight: 0.5
+
+# Tuning parameters (all optional; defaults shown)
+consensus: sum
+density: 1.0
+method: null        # null = no sparsification
+n: 64
+m: 256
+gamma: 0.0
+epsilon: 0.0
+rescale: true
+normalize: true
+lambda: 1.0
+chunk_elements: null
+skip_fingerprint_check: false

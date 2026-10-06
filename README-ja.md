@@ -83,6 +83,52 @@ goatmerge extract \
   --out /path/to/tv_dir
 ```
 
+### YAML レシピ
+
+コマンドラインにすべてのフラグを渡す代わりに、YAML レシピファイルを書いて
+`-c` で渡します：
+
+```bash
+goatmerge merge -c recipe.yaml
+```
+
+レシピファイルは `base`、`out`、`tv`/`model` エントリ、およびすべての
+チューニングパラメータを記述します。コマンドラインで渡したフラグは、
+対応する YAML 値を上書きします。
+
+```yaml
+# recipe.yaml
+base: /path/to/base_model
+out: /path/to/merged_output
+
+tv:
+  - dir: /path/to/tv1
+    weight: 0.7
+  - dir: /path/to/tv2
+    weight: 0.3
+
+# model:
+#   - dir: /path/to/source_model
+#     weight: 0.5
+
+consensus: sum
+density: 1.0
+method: null        # null = スパルシファイなし
+n: 64
+m: 256
+gamma: 0.0
+epsilon: 0.0
+rescale: true
+normalize: true
+lambda: 1.0
+chunk_elements: null
+skip_fingerprint_check: false
+```
+
+設定したいフィールドだけ書けばよく、省略したフィールドは既定値に
+フォールバックします。`tv` と `model` のエントリは、`dir:weight` の
+文字列、または `dir` + `weight` のマッピングのどちらでも受け入れます。
+
 ### オプション
 
 | フラグ | デフォルト | 説明 |

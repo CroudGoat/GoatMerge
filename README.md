@@ -88,6 +88,52 @@ goatmerge extract \
   --out /path/to/tv_dir
 ```
 
+### YAML recipe
+
+Instead of passing every flag on the command line, write a YAML recipe file
+and pass it with `-c`:
+
+```bash
+goatmerge merge -c recipe.yaml
+```
+
+A recipe file supplies `base`, `out`, `tv`/`model` entries, and all tuning
+parameters. Any flag you pass on the command line overrides the corresponding
+YAML value.
+
+```yaml
+# recipe.yaml
+base: /path/to/base_model
+out: /path/to/merged_output
+
+tv:
+  - dir: /path/to/tv1
+    weight: 0.7
+  - dir: /path/to/tv2
+    weight: 0.3
+
+# model:
+#   - dir: /path/to/source_model
+#     weight: 0.5
+
+consensus: sum
+density: 1.0
+method: null        # null = no sparsification
+n: 64
+m: 256
+gamma: 0.0
+epsilon: 0.0
+rescale: true
+normalize: true
+lambda: 1.0
+chunk_elements: null
+skip_fingerprint_check: false
+```
+
+Only the fields you want to set need to appear; omitted fields fall back to
+their defaults. `tv` and `model` entries accept either a bare `dir:weight`
+string or a `dir` + `weight` mapping.
+
 ### Options
 
 | Flag | Default | Description |
