@@ -25,6 +25,12 @@ import tempfile
 import time
 from pathlib import Path
 
+# Ensure the workspace root is on sys.path so goatmerge is importable
+# when the script is run as a file (sys.path[0] = script directory).
+_ROOT = str(Path(__file__).resolve().parent.parent)
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
+
 import safetensors.torch
 import torch
 
@@ -83,13 +89,26 @@ def _peak_rss_mb() -> float:
     return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0  # KB -> MB
 
 
-def _sample_peak_rss_mb(run) -> tuple[float, float]:
-    """Run ``run()`` while sampling VmRSS; return (elapsed_s, peak_rss_mb).
+def _read_vm_rss_mb() -> float:
+    """Read current VmRSS from /proc/self/status in MB."""
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024.0  # kB -> MB
+    return 0.0
+
+
+def _sample_peak_rss_mb(run) -> tuple[float, float, float]:
+    """Run ``run()`` while sampling VmRSS; return (elapsed_s, peak_rss_mb, baseline_rss_mb).
 
     ``ru_maxrss`` is a lifetime high-water mark that includes transient
     allocations (e.g. the float32 temporaries made while building the
     tensors), so it overstates the merge's steady-state peak. Sampling
     ``/proc/self/status`` VmRSS during the run captures the true peak.
+
+    ``baseline_rss_mb`` is the VmRSS read just before the run starts,
+    so ``marginal_peak = peak_rss_mb - baseline_rss_mb`` isolates the
+    memory increase attributable to the merge operation itself.
     """
     import threading
 
@@ -108,6 +127,7 @@ def _sample_peak_rss_mb(run) -> tuple[float, float]:
                 pass
             time.sleep(0.005)
 
+    baseline = _read_vm_rss_mb()
     t = threading.Thread(target=sampler)
     t0 = time.perf_counter()
     t.start()
@@ -115,7 +135,7 @@ def _sample_peak_rss_mb(run) -> tuple[float, float]:
     t1 = time.perf_counter()
     stop.set()
     t.join()
-    return t1 - t0, peak[0]
+    return t1 - t0, peak[0], baseline
 
 
 # --------------------------------------------------------------------------- #
@@ -189,9 +209,15 @@ def _build_models(root: Path) -> tuple[str, list[str]]:
 
 
 def _run_child(args: list[str]) -> dict:
+    # Ensure the workspace root is on PYTHONPATH so child subprocesses
+    # can import goatmerge (the script directory alone is not enough).
+    root = str(Path(__file__).resolve().parent.parent)
+    env = dict(os.environ)
+    existing = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = root + (":" + existing if existing else "")
     proc = subprocess.run(
         [sys.executable, str(Path(__file__).resolve())] + args,
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
     if proc.returncode != 0:
         raise RuntimeError(f"child failed:\n{proc.stderr}")
@@ -210,12 +236,13 @@ def main() -> None:
 
     s_mb = S_BYTES / (1024 * 1024)
     print(f"\n=== Benchmark: {N_TV}x{s_mb:.0f}MB bf16 task vectors ===")
-    print(f"{'engine':<16} {'time (s)':>10} {'peak RSS (MB)':>14}  notes")
-    print(f"{'GoatMerge':<16} {goat['time']:>10.3f} {goat['peak_mb']:>14.1f}  streaming (no stack)")
-    print(f"{'mergekit GTA':<16} {mk['time']:>10.3f} {mk['peak_mb']:>14.1f}  stack-based reference")
+    print(f"{'engine':<16} {'time (s)':>10} {'peak RSS (MB)':>14} {'marginal (MB)':>14}  notes")
+    print(f"{'GoatMerge':<16} {goat['time']:>10.3f} {goat['peak_mb']:>14.1f} {goat['marginal_peak_mb']:>14.1f}  streaming (no stack)")
+    print(f"{'mergekit GTA':<16} {mk['time']:>10.3f} {mk['peak_mb']:>14.1f} {mk['marginal_peak_mb']:>14.1f}  stack-based reference")
     print(f"{'parity max|d|':<16} {parity['max_diff']:>10.4f} {'(bf16 rtol=2e-2)':>14}")
     print(f"\nSpeedup (mergekit/GoatMerge): {mk['time']/goat['time']:.2f}x")
     print(f"Memory (GoatMerge/mergekit):   {goat['peak_mb']/mk['peak_mb']:.3f}")
+    print(f"Marginal (GoatMerge/mergekit): {goat['marginal_peak_mb']/mk['marginal_peak_mb']:.3f}")
 
     shutil.rmtree(tmp, ignore_errors=True)
 
@@ -227,12 +254,14 @@ if __name__ == "__main__":
         tv_dirs = sys.argv[3:3 + N_TV]
         weights = [float(x) for x in sys.argv[3 + N_TV:3 + 2 * N_TV]]
         if cmd == "goat":
-            t, peak = _sample_peak_rss_mb(lambda: child_goat(
+            t, peak, baseline = _sample_peak_rss_mb(lambda: child_goat(
                 base_dir, tv_dirs, weights, sys.argv[3 + 2 * N_TV]))
-            out = {"time": t, "peak_mb": peak}
+            out = {"time": t, "peak_mb": peak, "baseline_mb": baseline,
+                 "marginal_peak_mb": peak - baseline}
         elif cmd == "mergekit":
-            t, peak = _sample_peak_rss_mb(lambda: child_mergekit(base_dir, tv_dirs, weights))
-            out = {"time": t, "peak_mb": peak}
+            t, peak, baseline = _sample_peak_rss_mb(lambda: child_mergekit(base_dir, tv_dirs, weights))
+            out = {"time": t, "peak_mb": peak, "baseline_mb": baseline,
+                 "marginal_peak_mb": peak - baseline}
         elif cmd == "parity":
             out = {"max_diff": child_parity(base_dir, tv_dirs, weights)}
         else:
