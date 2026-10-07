@@ -82,6 +82,15 @@ result = (base + mixed).to(base.dtype)
 - マージ結果に `metadata.json`（base、TV 一覧、settings、fingerprint）
 - `inspect` で確認可能
 
+### 2.9 比較ベンチマーク（GoatMerge vs mergekit GTA）
+
+- 3×300 MB bf16 タスクベクトルで、ストリーミング（GoatMerge）vs stack 方式（mergekit GTA）を比較
+- 各エンジンを独立サブプロセスで実行し、`/proc/self/status` VmRSS を 5 ms 間隔でサンプリング
+- **増分メモリ**（ピーク − ベースライン）で、PyTorch ランタイム等の不可避オーバーヘッドを差し引いた純粋なマージ帰属メモリを計測
+- 結果: GoatMerge ピーク 3395 MB / 増分 3009 MB、mergekit ピーク 7289 MB / 増分 6904 MB（比 0.436）
+- 数値パリティ max|d| = 0.0625（bf16 rtol=2e-2 範囲で一致）
+- 詳細: [`Benchmarks/RESULTS.md`](Benchmarks/RESULTS.md)
+
 ## 3. 残課題・将来展望
 
 | # | 課題 | 現状 | 目標 |
@@ -118,6 +127,9 @@ tests/
   measure_peak_ram.py
 examples/
   merge_recipe.yaml   # YAML レシピ例
+Benchmarks/
+  benchmark_compare.py  # GoatMerge vs mergekit GTA 比較ベンチマーク
+  RESULTS.md            # ベンチマーク結果
 AGENTS.md             # プロジェクトガイド（gitignore）
 ambition.md           # 野心記録（gitignore）
 ```
