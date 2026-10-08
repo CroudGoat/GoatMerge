@@ -147,6 +147,7 @@ skip_fingerprint_check: false
 | `--gamma` | 0.0 | ガンマ閾値 |
 | `--epsilon` | 0.0 | エプシロン下限 |
 | `--rescale` | true | スパルシファイ後の正規化再計算 |
+| `--chunk-elements` | null | テンソルをこのサイズのチャンクに分割（チャンク分割モード） |
 
 ## 設計
 
@@ -200,19 +201,35 @@ Peak / S:          1.06  （目標: 5–7）
 パス間でテンソルが解放されるため（`l1` は `divisor` 前に、各 `delta` は
 蓄積後）です。
 
+### チャンク分割モード（大テンソル）
+
+`chunk_elements` 以上のテンソルでは、フラットなチャンク（
+`chunk_elements` 要素）に分割して処理します。各チャンクをディスクから
+読み込み、独立して蓄積し、事前割当の出力バッファにスライス代入で
+書き込みます。ピーク RAM は O(6–7 S) ではなく **O(S) + O(chunk)**：
+
+- `base` は遅延スライス（O(S) 割当なし）
+- チャンクごと: `base_chunk`、`delta_chunk`、`acc`/`l1`/`c` は O(chunk)
+- `out_flat` は O(S)（結果そのもの — 避けれない）
+
+YAML レシピの `chunk_elements`、または CLI の `--chunk-elements` で
+設定します。Slerp はチャンク分割非対応（全域ノーム依存）のため、
+警告とともに非チャンク経路にフォールバックします。
+
 ## テスト
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-43 テストがカバー：
+61 テストがカバー：
 - ストリーミングマージ（コンセンサスなし、consensus sum/count）
 - スパルシファイ（l1, l2, gamma, top-k）
 - 指紋検証
 - I/O（シャード型、単一シャード、サブ行列切り詰め）
 - メタデータエンベローブ
 - mergekit GTA との数値パリティ（rtol=2e-2, atol=1e-2）
+- チャンク分割マージ（パリティ + スパルシファイ有効性）
 
 ## ファイル構成
 
@@ -226,13 +243,17 @@ goatmerge/
   hf.py             # HF モデルディレクトリヘルパ
   inspect.py        # モデル検査
   io.py              # ShardReader, TensorWriter, ShardedTensorIndex
-  merge.py            # merge_model, merge_tensor
+  kernels.py         # 方式別マージカーネル
+  merge.py            # merge_model, merge_tensor（チャンク分割含む）
+  merge_method.py    # MergeMethod enum + build_kernel 分岐
   metadata.py         # メタデータエンベローブ
-  sparsify.py         # スパルシファイカーネル
+  sparsify.py         # スパルシファイカーネル + チャンク分割変種
 tests/
   test_consensus_merge.py   # パリティ + マージテスト
+  test_chunked_merge.py     # チャンク分割マージ（パリティ + 有効性）
   test_fingerprint.py
   test_io.py
+  test_kernels.py           # カーネル単体テスト
   test_metadata.py
   test_sparsify.py
   measure_peak_ram.py       # ピーク RAM 計測

@@ -152,6 +152,7 @@ string or a `dir` + `weight` mapping.
 | `--gamma` | 0.0 | Gamma threshold |
 | `--epsilon` | 0.0 | Epsilon floor |
 | `--rescale` | true | Rescale norm after sparsify |
+| `--chunk-elements` | null | Split tensor into chunks of this size (chunked mode) |
 
 ## Architecture
 
@@ -207,19 +208,36 @@ The streaming kernel is more memory-efficient than the 5–7 S worst-case
 budget because tensors are freed between passes (`l1` before `divisor`,
 each `delta` after accumulation).
 
+### Chunked mode (large tensors)
+
+For tensors larger than `chunk_elements`, the merge is split into flat
+chunks of `chunk_elements` elements. Each chunk is loaded from disk,
+accumulated independently, and written into a pre-allocated output buffer
+via slice assignment. Peak RAM drops to **O(S) + O(chunk)** instead of
+O(6–7 S):
+
+- `base` is a lazy slice (no full O(S) allocation)
+- Per-chunk: `base_chunk`, `delta_chunk`, `acc`/`l1`/`c` are O(chunk)
+- `out_flat` is O(S) (unavoidable — it IS the result)
+
+Set `chunk_elements` in the YAML recipe or `--chunk-elements` on the CLI.
+Slerp does not support chunked mode (global norm dependency) and falls
+back to the non-chunked path with a warning.
+
 ## Testing
 
 ```bash
 python -m pytest tests/ -v
 ```
 
-43 tests cover:
+61 tests cover:
 - Streaming merge (no-consensus, consensus sum/count)
 - Sparsify (l1, l2, gamma, top-k)
 - Fingerprint verification
 - I/O (sharded, single-shard, submatrix truncation)
 - Metadata envelope
 - Numerical parity vs mergekit GTA (rtol=2e-2, atol=1e-2)
+- Chunked merge parity + sparsify validity
 
 ## Files
 
@@ -233,13 +251,17 @@ goatmerge/
   hf.py             # HF model-dir helpers
   inspect.py        # Model inspection
   io.py              # ShardReader, TensorWriter, ShardedTensorIndex
-  merge.py            # merge_model, merge_tensor
+  kernels.py         # Per-method merge kernels
+  merge.py            # merge_model, merge_tensor (incl. chunked path)
+  merge_method.py    # MergeMethod enum + build_kernel dispatch
   metadata.py         # Metadata envelope
-  sparsify.py         # Sparsify kernels
+  sparsify.py         # Sparsify kernels + chunked variants
 tests/
   test_consensus_merge.py   # Parity + merge tests
+  test_chunked_merge.py     # Chunked merge parity + validity
   test_fingerprint.py
   test_io.py
+  test_kernels.py           # Kernel unit tests
   test_metadata.py
   test_sparsify.py
   measure_peak_ram.py       # Peak-RAM measurement
