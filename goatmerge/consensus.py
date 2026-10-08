@@ -35,6 +35,10 @@ from typing import Optional
 
 import torch
 
+from .io import load_delta
+from .merge_method import MergeKernel
+from .sparsify import sparsify_delta
+
 
 class ConsensusMethod(str, Enum):
     none = "none"
@@ -114,3 +118,57 @@ class ConsensusAccumulator:
     def divisor_accumulate(self, divisor: torch.Tensor, delta: torch.Tensor, alpha: float) -> None:
         """divisor += alpha * mask (in place)."""
         divisor.add_(self.mask_for(delta, alpha), alpha=alpha)
+
+
+class GtaKernel(MergeKernel):
+    """Generalized Task Arithmetic kernel (the reference method).
+
+    Streams each weighted delta once per pass. The no-consensus path is a single
+    pass; the consensus path needs a second streamed pass for the per-element
+    weight-sum divisor (re-reads the deltas via ``readers``). Peak RAM stays
+    ~5-7 S because only one delta is resident at a time.
+    """
+
+    def __init__(self, base: torch.Tensor, settings) -> None:
+        super().__init__(base, settings)
+        self._acc = ConsensusAccumulator(base, settings.consensus)
+
+    def accumulate(self, delta: torch.Tensor, weight: float) -> None:
+        self._acc.accumulate(delta, weight)
+
+    def finish(self, entries, readers, key: str) -> torch.Tensor:
+        s = self.settings
+        acc = self._acc
+        base = self.base
+        if s.consensus == ConsensusMethod.none:
+            mixed = acc.acc
+            if s.normalize:
+                wsum = sum(e.weight for e in entries)
+                if abs(wsum) < 1e-8:
+                    wsum = 1.0
+                mixed.div_(wsum)
+            if s.lambda_ != 1.0:
+                mixed.mul_(s.lambda_)
+            return (base + mixed).to(base.dtype)
+        # consensus: mixed = (acc + M*l1)/2 in place
+        mixed = acc.masked_sum_inplace()
+        del acc.l1
+        divisor = torch.zeros_like(base)
+        for entry in entries:
+            delta = load_delta(base, entry.dir, entry.kind, key, readers)
+            if delta is None:
+                continue
+            sparsify_delta(
+                delta, s.method,
+                density=s.density, n=s.n, m=s.m, gamma=s.gamma,
+                epsilon=s.epsilon, rescale=s.rescale,
+                chunk_elements=s.chunk_elements,
+            )
+            acc.divisor_accumulate(divisor, delta, entry.weight)
+            del delta
+        divisor[divisor == 0] = 1
+        if s.normalize:
+            mixed.div_(divisor)
+        if s.lambda_ != 1.0:
+            mixed.mul_(s.lambda_)
+        return (base + mixed).to(base.dtype)

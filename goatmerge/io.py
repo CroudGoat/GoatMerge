@@ -18,7 +18,7 @@ import os
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping
+from typing import Dict, List, Mapping, Optional
 
 import safetensors
 import safetensors.torch
@@ -161,6 +161,68 @@ class ShardReader:
         self.close()
 
 
+def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict):
+    """Load ``delta = W_i - base`` (``kind="model"``) or the stored TV (``kind="tv"``).
+
+    Returns ``None`` if the tensor is missing or size-incompatible. The
+    returned tensor owns its storage (cloned). ``entry_dir`` is a ``Path`` and
+    ``kind`` is ``"tv"`` or ``"model"`` (no ``ModelEntry`` import, so this stays
+    import-cycle-free).
+    """
+    reader = readers[entry_dir]
+    if key not in reader.index.tensor_paths:
+        logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
+        return None
+    t = reader.get_tensor(key)
+    if t.shape != base.shape:
+        # embed-style submatrix: truncate when the TV is a superset grid
+        if (
+            base.dim() >= 2
+            and t.dim() >= 2
+            and t.shape[0] >= base.shape[0]
+            and t.shape[1] >= base.shape[1]
+            and t.shape[2:] == base.shape[2:]
+        ):
+            logger.warning("using submatrix of %s:%s", entry_dir, key)
+            t = t[: base.shape[0], : base.shape[1], *base.shape[2:]]
+        else:
+            logger.warning("skipping %s:%s due to size mismatch", entry_dir, key)
+            return None
+    if kind == "tv":
+        return t.to(base.dtype).clone()
+    # model mode: delta = W_i - base (in place after clone)
+    t = t.to(base.dtype).clone()
+    t.sub_(base)
+    return t
+
+
+def load_delta_chunk(
+    base_chunk: torch.Tensor,
+    entry_dir,
+    kind: str,
+    key: str,
+    readers: dict,
+    start: int,
+    end: int,
+) -> Optional[torch.Tensor]:
+    """Load a flat sub-range ``[start:end]`` of the tensor as a delta chunk.
+
+    Returns ``None`` if the tensor is missing. The returned tensor owns its
+    storage (cloned). Used by the chunked merge path to stream-load base and
+    delta chunks from disk without holding the full tensor.
+    """
+    reader = readers[entry_dir]
+    if key not in reader.index.tensor_paths:
+        return None
+    t = reader.get_slice(key)[start:end]
+    if kind == "tv":
+        return t.to(base_chunk.dtype).clone()
+    # model mode: delta = W_i - base_chunk
+    t = t.to(base_chunk.dtype).clone()
+    t.sub_(base_chunk)
+    return t
+
+
 # --------------------------------------------------------------------------- #
 # Output writer: emits the exact HF sharded-safetensors layout.
 # --------------------------------------------------------------------------- #
@@ -175,7 +237,7 @@ class TensorWriter:
     def __init__(
         self,
         out_path: str,
-        max_shard_size: int = 5_000_000_000,
+        max_shard_size: int = 1_000_000_000,
         safe_serialization: bool = True,
     ) -> None:
         os.makedirs(out_path, exist_ok=True)

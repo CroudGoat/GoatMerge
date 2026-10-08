@@ -26,6 +26,7 @@ from .extract import extract_task_vector
 from .hf import resolve_model_dir
 from .inspect import inspect_dir, verify_against_base
 from .merge import ModelEntry, MergeSettings, merge_model
+from .merge_method import MergeMethod
 from .metadata import build_merged_metadata, write_metadata
 from .sparsify import SparsificationMethod
 
@@ -57,6 +58,7 @@ def _resolve_param(cli_val, yaml_dict: dict, key: str, default):
 
 
 def _build_settings(args, yaml_dict: dict) -> MergeSettings:
+    merge_method = _resolve_param(args.merge_method, yaml_dict, "merge_method", "gta")
     density = _resolve_param(args.density, yaml_dict, "density", 1.0)
     method_str = _resolve_param(args.method, yaml_dict, "method", None)
     n = _resolve_param(args.n, yaml_dict, "n", 64)
@@ -74,6 +76,7 @@ def _build_settings(args, yaml_dict: dict) -> MergeSettings:
         method = SparsificationMethod(method_str)
 
     return MergeSettings(
+        merge_method=MergeMethod(merge_method),
         density=density,
         method=method,
         n=n,
@@ -178,6 +181,7 @@ def cmd_merge(args) -> int:
         tensor_names=summary["tensor_names"],
         dtype=None,
         merge_settings={
+            "merge_method": settings.merge_method.value,
             "density": settings.density,
             "method": settings.method.value if settings.method else None,
             "n": settings.n,
@@ -221,6 +225,12 @@ def main(argv=None) -> int:
     pm.add_argument("--config", "-c", default=None, help="YAML recipe file (provides base, out, tv, model, and tuning params)")
     pm.add_argument("--base", default=None, help="base model dir or HF repo id (overrides YAML)")
     pm.add_argument("--out", default=None, help="output merged-model directory (overrides YAML)")
+    pm.add_argument(
+        "--merge-method",
+        choices=[m.value for m in MergeMethod],
+        default=None,
+        help="merge method: gta (default) | linear | mixture | slerp | ties",
+    )
     pm.add_argument("--tv", action="append", help="task-vector dir:weight (repeatable; overrides YAML)")
     pm.add_argument("--model", action="append", help="source model dir:weight (repeatable; overrides YAML)")
     pm.add_argument("--consensus", choices=["none", "sum", "count"], default=None)

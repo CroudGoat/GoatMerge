@@ -99,11 +99,76 @@ result = (base + mixed).to(base.dtype)
 | 2 | 多 GPU 分配 | 未 | チャンク単位で GPU 間分配 |
 | 3 | GPU カーネル | CPU 専用 | CUDA 対応（`torch` GPU 経路） |
 | 4 | 大規模 AWA 探索 | 未 | λ/consensus/sparsify の自動探索 |
-| 5 | RoMM ルーティング | 未 | 複数ベース間ルーティング |
 | 6 | CABS 統合 | 未 | BS 剪定を GAT に統合（一部実装済み） |
 | 7 | 並列 TV 抽出 | 未 | k 個 TV を並列抽出 |
 
-## 4. ファイル構成（現状）
+## 4. 省メモリ化・高速化の改善ポイント（調査結果）
+
+コードベースを調査し、以下の改善可能性を特定した。
+
+### 4.1 `TensorWriter` — 全テンソルをRAMに滞留（最大影響）
+
+- **現状:** `save_tensor()` が全テンソルを `current_shard`（dict）に蓄積し、
+  `max_shard_size`（5GB）を超えて初めてディスクに書き出す。
+  7Bモデル（bf16 約14GB、約400テンソル）では全テンソルが同時にRAMに存在。
+- **改善:** テンソルを小バッチ（10–20個）で分割して書き出す。
+  `max_shard_size` を小さく設定するか、`save_tensor` ごとに即座にフラッシュ。
+- **効果:** ピークRAMを ~14GB → ~1–2GB に削減。
+
+### 4.2 `SlerpKernel.finish` — float32一時テンソル4–5個（slerp固有）
+
+- **現状:** `base.float()` / `acc.float()` / `v1/n1` / `v2/n2` で
+  bf16テンソル1個あたり float32 一時テンソル4–5個（合計 ~4x bf16サイズ）。
+- **改善:** bf16のまま計算する（最終結果は bf16 にキャストされるため精度損失なし）。
+  in-place 演算で一時テンソルを削減。
+- **効果:** slerpのピークRAMを ~4x 削減。
+
+### 4.3 `_weighted` / `ConsensusAccumulator.accumulate` — 呼び出し毎に1要素テンソル生成
+
+- **現状:** `torch.tensor(weight, dtype=delta.dtype)` を毎呼び出し生成。
+  PyTorchは `delta.mul_(weight)`（Python float直接）をネイティブにサポート。
+- **改善:** `torch.tensor()` ラッパーを除去し `delta.mul_(weight)` を直接使用。
+- **効果:** 各accumulate呼び出しの微小オーバーヘッドを除去。
+
+### 4.4 `della_mask` — `torch.argsort` がint64インデックスを全サイズ割り当て
+
+- **現状:** `torch.argsort(magnitudes, dim=1)` で R×C × 8B（int64）× 2 の一時テンソル。
+- **改善:** チャンク分割で処理（`iter_chunks` 使用）。
+- **効果:** della_magpruneのピークRAMを ~4x 削減。
+
+### 4.5 `fingerprint.tensor_content_hash` — アンカーテンソルのfloat32コピー
+
+- **現状:** bf16/fp16アンカーテンソルを float32 に変換（2xサイズ一時テンソル）。
+- **改善:** チャンク分割でハッシュを計算（各チャンクを読み込み→ハッシュ→解放）。
+- **効果:** 指紋計算時のピークRAMを ~2x 削減。
+
+### 4.6 `magnitude_mask` / `bs_mask` — `_abs_flat` による全サイズフラットテンソル
+
+- **現状:** `tensor.abs().reshape(-1)` で全サイズフラットテンソルを生成。
+  チャンク版（`magnitude_mask_chunked` / `bs_mask_chunked`）は存在するが、
+  非チャンク版では全サイズ一時テンソルが割り当てられる。
+- **改善:** 非チャンク版もチャンク分割に統一。
+- **効果:** スパルシファイのピークRAMを ~1x 削減。
+
+### 4.7 `bernoulli_mask` — `torch.full_like` による全サイズテンソル
+
+- **現状:** `torch.full_like(input=t, fill_value=density)` で全サイズテンソル生成。
+- **改善:** `torch.bernoulli_`（in-place版）を使用、またはチャンク分割。
+- **効果:** bernoulliマスクのピークRAMを ~1x 削減。
+
+### 優先度
+
+| # | 対象 | 種別 | 影響度 | 実装難度 |
+|---|------|------|--------|----------|
+| 1 | `TensorWriter` ストリーミング書き出し | 省メモリ | **大** | 中 |
+| 2 | `SlerpKernel` bf16計算 | 省メモリ+高速 | **大** | 小 |
+| 3 | `_weighted` スカラー直接 | 高速 | 小 | **最小** |
+| 4 | `della_mask` チャンク分割 | 省メモリ | 中 | 中 |
+| 5 | `fingerprint` チャンクハッシュ | 省メモリ | 中 | 中 |
+| 6 | `magnitude_mask` チャンク統一 | 省メモリ | 小 | 小 |
+| 7 | `bernoulli_mask` in-place | 省メモリ | 小 | 最小 |
+
+## 5. ファイル構成（現状）
 
 ```
 goatmerge/
@@ -134,7 +199,7 @@ AGENTS.md             # プロジェクトガイド（gitignore）
 ambition.md           # 野心記録（gitignore）
 ```
 
-## 5. 環境
+## 6. 環境
 
 - ワークスペース: `/home/CloudGoat/llms_merge/GoatMerge`
 - インタープリタ: `/home/CloudGoat/venvs/mergekit/bin/python`

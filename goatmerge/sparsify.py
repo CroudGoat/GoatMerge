@@ -223,10 +223,19 @@ def sparsify_inplace(
 
     n_elems = t.numel()
     chunked = chunk_elements is not None and n_elems > max(1, chunk_elements)
-    if method == SparsificationMethod.magnitude and chunked:
-        mask = magnitude_mask_chunked(t, density, chunk_elements)
-    elif method == SparsificationMethod.bs and chunked:
-        mask = bs_mask_chunked(t, n, m, chunk_elements)
+    if chunked:
+        if method == SparsificationMethod.magnitude:
+            mask = magnitude_mask_chunked(t, density, chunk_elements)
+        elif method == SparsificationMethod.bs:
+            mask = bs_mask_chunked(t, n, m, chunk_elements)
+        elif method == SparsificationMethod.magnitude_outliers:
+            mask = magnitude_outliers_mask_chunked(t, density, gamma, chunk_elements)
+        elif method == SparsificationMethod.random:
+            mask = bernoulli_mask_chunked(t, density, chunk_elements)
+        elif method == SparsificationMethod.della_magprune:
+            mask = della_mask_chunked(t, density, epsilon, chunk_elements)
+        else:
+            mask = make_mask(t, density, method, n=n, m=m, gamma=gamma, epsilon=epsilon)
     else:
         mask = make_mask(t, density, method, n=n, m=m, gamma=gamma, epsilon=epsilon)
 
@@ -239,6 +248,40 @@ def sparsify_inplace(
         t.mul_(before / after)
     else:
         t.mul_(mask.to(t.dtype))
+    return t
+
+
+def sparsify_delta(
+    t: torch.Tensor,
+    method,
+    density: float = 1.0,
+    n: int = 64,
+    m: int = 256,
+    gamma: float = 0.0,
+    epsilon: float = 0.0,
+    rescale: bool = True,
+    chunk_elements: Optional[int] = None,
+) -> torch.Tensor:
+    """Apply sparsification in place to one streamed delta.
+
+    A settings-free wrapper around :func:`sparsify_inplace` so the per-method
+    kernels can sparsify a streamed delta without importing ``MergeSettings``
+    (keeps the kernel modules import-cycle-free).
+    """
+    if method is None:
+        return t
+    rescale_norm = RescaleNorm.l1 if rescale else None
+    sparsify_inplace(
+        t,
+        density=density,
+        method=method,
+        n=n,
+        m=m,
+        gamma=gamma,
+        epsilon=epsilon,
+        rescale_norm=rescale_norm,
+        chunk_elements=chunk_elements,
+    )
     return t
 
 
@@ -337,4 +380,131 @@ def bs_mask_chunked(t: torch.Tensor, n: int, m: int, chunk_elements: int) -> tor
             bm = torch.zeros_like(blocks, dtype=torch.uint8).scatter_(1, topk, 1)
             chunk_mask = bm.reshape(-1)
         mask[start:start + c] = chunk_mask
+    return mask.reshape_as(t)
+
+
+# --------------------------------------------------------------------------- #
+# Range iterator (no tensor required)
+# --------------------------------------------------------------------------- #
+def iter_chunk_ranges(n_total: int, chunk_elements: int, align: int = 1) -> Iterator[Tuple[int, int]]:
+    """Yield (start, end) pairs for flat chunks of ``n_total`` elements.
+
+    A pure-Python range iterator: no tensor is needed, so the chunked merge
+    path can iterate over ranges before loading any data.
+    """
+    if chunk_elements <= 0 or chunk_elements >= n_total:
+        yield 0, n_total
+        return
+    align = max(1, align)
+    step = max(1, (chunk_elements // align) * align)
+    for start in range(0, n_total, step):
+        end = min(start + step, n_total)
+        yield start, end
+
+
+# --------------------------------------------------------------------------- #
+# Chunked mask builders for the remaining methods
+# --------------------------------------------------------------------------- #
+def magnitude_outliers_mask_chunked(
+    t: torch.Tensor,
+    density: float,
+    gamma: float,
+    chunk_elements: int,
+) -> torch.Tensor:
+    """Global magnitude_outliers mask in two passes over chunks.
+
+    Pass 1 finds the global top-γ and bottom-(1-d-γ) thresholds via bounded
+    heaps. Pass 2 keeps the middle elements per chunk.
+    """
+    n = t.numel()
+    target = int(round(density * n))
+    n_top = int(round(gamma * n))
+    n_bot = n - target - n_top
+    if n_bot < 0:
+        n_top += n_bot
+        n_bot = 0
+    n_top = max(0, min(n, n_top))
+    n_bot = max(0, min(n, n_bot))
+
+    # Pass 1: find global thresholds via bounded heaps
+    top_thr = _topk_threshold(t, n_top) if n_top > 0 else 0.0
+    bot_thr = _bottomk_threshold(t, n_bot) if n_bot > 0 else 0.0
+
+    # Pass 2: apply per chunk
+    mask = torch.zeros(n, dtype=torch.uint8, device=t.device)
+    start = 0
+    for chunk in iter_chunks(t, chunk_elements, align=1):
+        w = _abs_flat(chunk)
+        c = chunk.numel()
+        keep = torch.ones(c, dtype=torch.uint8, device=t.device)
+        if n_top > 0:
+            keep[(w >= top_thr)] = 0
+        if n_bot > 0:
+            keep[(w <= bot_thr)] = 0
+        mask[start:start + c] = keep
+        start += c
+    return mask.reshape_as(t)
+
+
+def _topk_threshold(t: torch.Tensor, k: int) -> float:
+    """The k-th largest |value| of ``t`` via a bounded max-heap."""
+    if k <= 0:
+        return 0.0
+    heap: List[float] = []
+    for chunk in iter_chunks(t, chunk_elements=10_000_000):
+        w = _abs_flat(chunk)
+        take = min(k, w.numel())
+        if take == 0:
+            continue
+        vals = torch.topk(w, take).values.detach().cpu().numpy().ravel()
+        for v in vals:
+            if len(heap) < k:
+                heapq.heappush(heap, v)
+            elif v > heap[0]:
+                heapq.heapreplace(heap, v)
+    return float(heap[0]) if heap else 0.0
+
+
+def _bottomk_threshold(t: torch.Tensor, k: int) -> float:
+    """The k-th smallest |value| of ``t`` via a bounded min-heap (on -w)."""
+    if k <= 0:
+        return 0.0
+    heap: List[float] = []
+    for chunk in iter_chunks(t, chunk_elements=10_000_000):
+        w = _abs_flat(chunk)
+        neg_w = -w
+        take = min(k, neg_w.numel())
+        if take == 0:
+            continue
+        vals = torch.topk(neg_w, take).values.detach().cpu().numpy().ravel()
+        for v in vals:
+            if len(heap) < k:
+                heapq.heappush(heap, v)
+            elif v > heap[0]:
+                heapq.heapreplace(heap, v)
+    return -float(heap[0]) if heap else 0.0
+
+
+def bernoulli_mask_chunked(t: torch.Tensor, density: float, chunk_elements: int) -> torch.Tensor:
+    """Bernoulli mask per chunk (per-element, so chunking is exact)."""
+    mask = torch.zeros(t.numel(), dtype=torch.uint8, device=t.device)
+    start = 0
+    for chunk in iter_chunks(t, chunk_elements, align=1):
+        c = chunk.numel()
+        chunk_mask = bernoulli_mask(chunk, density).reshape(-1)
+        mask[start:start + c] = chunk_mask
+        start += c
+    return mask.reshape_as(t)
+
+
+def della_mask_chunked(t: torch.Tensor, density: float, epsilon: float, chunk_elements: int) -> torch.Tensor:
+    """Della mask per chunk (per-row, so chunking aligned to rows is exact)."""
+    row_stride = _row_stride(t)
+    mask = torch.zeros(t.numel(), dtype=torch.uint8, device=t.device)
+    start = 0
+    for chunk in iter_chunks(t, chunk_elements, align=row_stride):
+        c = chunk.numel()
+        chunk_mask = della_mask(chunk, density, epsilon).reshape(-1)
+        mask[start:start + c] = chunk_mask
+        start += c
     return mask.reshape_as(t)
