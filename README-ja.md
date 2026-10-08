@@ -124,6 +124,9 @@ tv:
 #   - dir: /path/to/source_model
 #     weight: 0.5
 
+# --- マージ方式 ---
+merge_method: gta                # gta | linear | mixture | slerp | ties  （既定: gta）
+
 # --- コンセンサス（マスク和） ---
 consensus: sum                   # none | sum | count  （既定: none）
 
@@ -158,11 +161,12 @@ CLI フラグは対応する YAML 値を上書きするため、レシピをベ�
 | `--tv` / `--model` | （1 以上） | タスクベクトルディレクトリ、またはソースモデルディレクトリ |
 | `--weight` | 1.0 | 各エントリのマージ重み |
 | `--out` | （必須） | 出力ディレクトリ |
+| `--merge-method` | `gta` | マージ方式: `gta` \| `linear` \| `mixture` \| `slerp` \| `ties` |
 | `--consensus` | `none` | `none` \| `sum` \| `count` |
 | `--normalize` | true | 要素ごとの除数で割る |
 | `--lambda` | 1.0 | ミックステンソルの倍率 |
 | `--density` | 1.0 | スパルシファイ密度（0 = スキップ） |
-| `--method` | （なし） | スパルシファイ方式: `l1` \| `l2` \| `gamma` |
+| `--method` | （なし） | スパルシファイ方式: `l1` \| `l2` \| `gamma` \| `topk` |
 | `--n` | 64 | スパルシファイの top-k 件数 |
 | `--m` | 256 | スパルシファイのブロックサイズ |
 | `--gamma` | 0.0 | ガンマ閾値 |

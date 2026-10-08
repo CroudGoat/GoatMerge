@@ -128,6 +128,9 @@ tv:
 #   - dir: /path/to/source_model
 #     weight: 0.5
 
+# --- Merge method ---
+merge_method: gta                # gta | linear | mixture | slerp | ties  (default: gta)
+
 # --- Consensus (masked-sum) ---
 consensus: sum                   # none | sum | count  (default: none)
 
@@ -163,11 +166,12 @@ file.
 | `--tv` / `--model` | (≥1) | Task-vector dir(s) or source model dir(s) |
 | `--weight` | 1.0 | Merge weight per entry |
 | `--out` | (required) | Output directory |
+| `--merge-method` | `gta` | Merge algorithm: `gta` \| `linear` \| `mixture` \| `slerp` \| `ties` |
 | `--consensus` | `none` | `none` \| `sum` \| `count` |
 | `--normalize` | true | Divide by per-element divisor |
 | `--lambda` | 1.0 | Scale factor on the mixed tensor |
 | `--density` | 1.0 | Sparsify density (0 = skip) |
-| `--method` | (none) | Sparsify method: `l1` \| `l2` \| `gamma` |
+| `--method` | (none) | Sparsify method: `l1` \| `l2` \| `gamma` \| `topk` |
 | `--n` | 64 | Top-k count for sparsify |
 | `--m` | 256 | Block size for sparsify |
 | `--gamma` | 0.0 | Gamma threshold |
