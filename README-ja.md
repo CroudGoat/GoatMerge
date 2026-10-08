@@ -85,49 +85,70 @@ goatmerge extract \
 
 ### YAML レシピ
 
-コマンドラインにすべてのフラグを渡す代わりに、YAML レシピファイルを書いて
-`-c` で渡します：
+コマンドラインにすべてのフラグを打つ代わりに、YAML ファイルを `-c` で
+渡します：
 
 ```bash
 goatmerge merge -c recipe.yaml
 ```
 
-レシピファイルは `base`、`out`、`tv`/`model` エントリ、およびすべての
-チューニングパラメータを記述します。コマンドラインで渡したフラグは、
-対応する YAML 値を上書きします。
+**最小レシピ**（必須フィールドのみ）：
 
 ```yaml
-# recipe.yaml
 base: /path/to/base_model
 out: /path/to/merged_output
-
 tv:
   - dir: /path/to/tv1
     weight: 0.7
+```
+
+これだけで動きます。それ以外はすべて任意で、省略したフィールドは既定値に
+フォールバックします。
+
+**完全レシピ**（全フィールド、コメント付き）：
+
+```yaml
+# --- 必須 ---
+base: /path/to/base_model        # ベースモデルディレクトリ（HF シャード型 safetensors）
+out: /path/to/merged_output      # マージ結果の出力先
+
+# --- タスクベクトル（1 以上） ---
+tv:
+  - dir: /path/to/tv1            # タスクベクトルディレクトリ
+    weight: 0.7                  # この TV のマージ重み
   - dir: /path/to/tv2
     weight: 0.3
 
+# --- ソースモデル（tv の代替；tv/model のいずれか 1 以上） ---
 # model:
 #   - dir: /path/to/source_model
 #     weight: 0.5
 
-consensus: sum
-density: 1.0
-method: null        # null = スパルシファイなし
-n: 64
-m: 256
-gamma: 0.0
-epsilon: 0.0
-rescale: true
-normalize: true
-lambda: 1.0
-chunk_elements: null
-skip_fingerprint_check: false
+# --- コンセンサス（マスク和） ---
+consensus: sum                   # none | sum | count  （既定: none）
+
+# --- スパルシファイ ---
+density: 1.0                     # 0 = スキップ、1.0 = 全保持（既定: 1.0）
+method: null                     # null = スパルシファイなし; l1 | l2 | gamma | topk
+n: 64                            # top-k 件数（既定: 64）
+m: 256                           # ブロックサイズ（既定: 256）
+gamma: 0.0                       # ガンマ閾値（既定: 0.0）
+epsilon: 0.0                     # エプシロン下限（既定: 0.0）
+rescale: true                    # スパルシファイ後のノーム再計算（既定: true）
+
+# --- 正規化・倍率 ---
+normalize: true                  # 要素ごと除数で割る（既定: true）
+lambda: 1.0                      # ミックステンソルの倍率（既定: 1.0）
+
+# --- チャンク分割モード（大テンソル用） ---
+chunk_elements: null             # テンソルをこの要素数でチャンク分割
+
+# --- 指紋 ---
+skip_fingerprint_check: false    # ベース指紋検証をスキップ
 ```
 
-設定したいフィールドだけ書けばよく、省略したフィールドは既定値に
-フォールバックします。`tv` と `model` のエントリは、`dir:weight` の
-文字列、または `dir` + `weight` のマッピングのどちらでも受け入れます。
+CLI フラグは対応する YAML 値を上書きするため、レシピをベースにして
+コマンドラインで 1 つだけ変える、という使い方もできます。
 
 ### オプション
 

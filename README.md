@@ -90,49 +90,70 @@ goatmerge extract \
 
 ### YAML recipe
 
-Instead of passing every flag on the command line, write a YAML recipe file
-and pass it with `-c`:
+Pass a YAML file with `-c` instead of typing every flag on the command line:
 
 ```bash
 goatmerge merge -c recipe.yaml
 ```
 
-A recipe file supplies `base`, `out`, `tv`/`model` entries, and all tuning
-parameters. Any flag you pass on the command line overrides the corresponding
-YAML value.
+**Minimal recipe** (the only required fields):
 
 ```yaml
-# recipe.yaml
 base: /path/to/base_model
 out: /path/to/merged_output
-
 tv:
   - dir: /path/to/tv1
     weight: 0.7
+```
+
+That's all you need. Everything else is optional and falls back to its
+default if omitted.
+
+**Full recipe** (every field, annotated):
+
+```yaml
+# --- Required ---
+base: /path/to/base_model        # base model directory (HF-sharded safetensors)
+out: /path/to/merged_output      # where the merged model is written
+
+# --- Task vectors (at least one) ---
+tv:
+  - dir: /path/to/tv1            # task-vector directory
+    weight: 0.7                  # merge weight for this TV
   - dir: /path/to/tv2
     weight: 0.3
 
+# --- Source models (alternative to tv; at least one of tv/model) ---
 # model:
 #   - dir: /path/to/source_model
 #     weight: 0.5
 
-consensus: sum
-density: 1.0
-method: null        # null = no sparsification
-n: 64
-m: 256
-gamma: 0.0
-epsilon: 0.0
-rescale: true
-normalize: true
-lambda: 1.0
-chunk_elements: null
-skip_fingerprint_check: false
+# --- Consensus (masked-sum) ---
+consensus: sum                   # none | sum | count  (default: none)
+
+# --- Sparsification ---
+density: 1.0                     # 0 = skip, 1.0 = keep all (default: 1.0)
+method: null                     # null = no sparsify; l1 | l2 | gamma | topk
+n: 64                            # top-k count (default: 64)
+m: 256                           # block size (default: 256)
+gamma: 0.0                       # gamma threshold (default: 0.0)
+epsilon: 0.0                     # epsilon floor (default: 0.0)
+rescale: true                    # rescale norm after sparsify (default: true)
+
+# --- Normalization & scaling ---
+normalize: true                  # divide by per-element divisor (default: true)
+lambda: 1.0                      # scale factor on the mixed tensor (default: 1.0)
+
+# --- Chunked mode (for very large tensors) ---
+chunk_elements: null             # split tensor into chunks of this many elements
+
+# --- Fingerprint ---
+skip_fingerprint_check: false    # skip base fingerprint verification
 ```
 
-Only the fields you want to set need to appear; omitted fields fall back to
-their defaults. `tv` and `model` entries accept either a bare `dir:weight`
-string or a `dir` + `weight` mapping.
+CLI flags override the corresponding YAML values, so you can set a recipe
+as a baseline and tweak one value on the command line without editing the
+file.
 
 ### Options
 
