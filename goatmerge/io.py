@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -123,19 +124,81 @@ class ShardReader:
     ``get_tensor`` (one per call).
     """
 
-    def __init__(self, index: ShardedTensorIndex):
+    def __init__(self, index: ShardedTensorIndex, use_mmap: bool = False):
         self.index = index
         self._handles: Dict[str, "safetensors.torch.safe_open"] = {}
+        self._use_mmap = use_mmap
+        self._direct_cache: Dict[str, tuple] = {}  # key -> (dtype, shape, offset)
+
+    def _read_direct(self, key: str) -> torch.Tensor:
+        """Read a tensor directly from disk without mmap."""
+        return self._read_rows(key, 0, None)
+
+    def _read_rows(self, key: str, row_start: int, row_end: Optional[int]) -> torch.Tensor:
+        """Read specific rows of a tensor directly from disk.
+
+        For a tensor with shape (R, C1, C2, ..., Ck) stored in row-major
+        order, row ``i`` starts at byte offset ``i * (C1*C2*...*Ck) *
+        element_size`` within the tensor data. We seek to the correct
+        offset and read only the needed bytes.
+        """
+        shard_name = self.index.shard_filename(key)
+        path = Path(self.index.base_path) / shard_name
+        with open(str(path), "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            f.seek(8)
+            header_json = f.read(header_len)
+            meta = json.loads(header_json)
+            entry = meta[key]
+            dtype_str = entry["dtype"]
+            shape = tuple(entry["shape"])
+            data_start, data_end = entry["data_offsets"]
+            # data_offsets are relative to the data-section start (8 + header_len),
+            # not absolute file positions. Add the base to get the absolute offset.
+            base = 8 + header_len
+            dtype_map = {
+                "BF16": torch.bfloat16,
+                "F16": torch.float16,
+                "F32": torch.float32,
+                "F64": torch.float64,
+                "I32": torch.int32,
+                "I64": torch.int64,
+            }
+            dtype = dtype_map.get(dtype_str, torch.bfloat16)
+            # Compute the byte offset for the row range.
+            # For a (R, C1, C2, ..., Ck) tensor, row i starts at byte
+            # i * (C1*C2*...*Ck) * element_size within the tensor data.
+            n_rows = shape[0]
+            cols = 1
+            for s in shape[1:]:
+                cols *= s
+            elem_size = torch.tensor([], dtype=dtype).element_size()
+            row_start_byte = base + data_start + row_start * cols * elem_size
+            if row_end is None:
+                row_end = n_rows
+            row_end_byte = base + data_start + row_end * cols * elem_size
+            f.seek(row_start_byte)
+            raw = f.read(row_end_byte - row_start_byte)
+            # Use a writable bytearray to avoid the non-writable buffer warning.
+            buf = bytearray(raw)
+            t = torch.frombuffer(buf, dtype=dtype).reshape(
+                (row_end - row_start,) + shape[1:]
+            )
+            return t.clone()
 
     def get_slice(self, key: str):
         """Return a reusable slice object for ``key`` (opened on first use)."""
-        shard_name = self.index.shard_filename(key)
-        if shard_name not in self._handles:
-            path = Path(self.index.base_path) / shard_name
-            self._handles[shard_name] = safetensors.torch.safe_open(
-                str(path), framework="pt", device="cpu"
-            )
-        return self._handles[shard_name].get_slice(key)
+        if self._use_mmap:
+            shard_name = self.index.shard_filename(key)
+            if shard_name not in self._handles:
+                path = Path(self.index.base_path) / shard_name
+                self._handles[shard_name] = safetensors.torch.safe_open(
+                    str(path), framework="pt", device="cpu"
+                )
+            return self._handles[shard_name].get_slice(key)
+        else:
+            # Direct read: return a wrapper that supports [start:end] slicing
+            return _DirectSlice(self, key)
 
     def get_tensor(self, key: str) -> torch.Tensor:
         """Load one full tensor into memory.
@@ -143,7 +206,10 @@ class ShardReader:
         NOTE: the returned tensor shares storage with the shard's cached copy,
         so callers that mutate it in place must first ``.clone()`` it.
         """
-        return self.get_slice(key)[:]
+        if self._use_mmap:
+            return self.get_slice(key)[:]
+        else:
+            return self._read_direct(key)
 
     def keys(self) -> List[str]:
         return self.index.keys()
@@ -159,6 +225,56 @@ class ShardReader:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
+
+
+class _DirectSlice:
+    """Wrapper that supports [start:end] row slicing via direct disk reads.
+
+    Provides the same interface as ``safe_open(...).get_slice(key)``:
+    ``get_shape()`` and ``get_dtype()`` for shape/dtype inspection, and
+    ``[start:end]`` for row slicing. Shape/dtype are read from the safetensors
+    header (no full-tensor load).
+    """
+
+    def __init__(self, reader: "ShardReader", key: str):
+        self._reader = reader
+        self._key = key
+        self._shape: Optional[tuple] = None
+        self._dtype_str: Optional[str] = None
+
+    def _read_header_entry(self) -> dict:
+        """Read the safetensors header entry for this key (no tensor data)."""
+        shard_name = self._reader.index.shard_filename(self._key)
+        path = Path(self._reader.index.base_path) / shard_name
+        with open(str(path), "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            header_json = f.read(header_len)
+            meta = json.loads(header_json)
+            return meta[self._key]
+
+    def get_shape(self) -> list:
+        if self._shape is None:
+            entry = self._read_header_entry()
+            self._shape = tuple(entry["shape"])
+            self._dtype_str = entry["dtype"]
+        return list(self._shape)
+
+    def get_dtype(self) -> str:
+        if self._dtype_str is None:
+            self.get_shape()  # triggers the header read
+        return self._dtype_str
+
+    def __getitem__(self, idx):
+        # idx is a slice object (start, end)
+        if isinstance(idx, slice):
+            start, end = idx.start, idx.stop
+            if start is None:
+                start = 0
+            if end is None:
+                end = self._shape[0] if self._shape else None
+            result = self._reader._read_rows(self._key, start, end)
+            return result
+        raise TypeError("only slice indexing is supported")
 
 
 def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict):
@@ -214,6 +330,8 @@ def load_delta_chunk(
     reader = readers[entry_dir]
     if key not in reader.index.tensor_paths:
         return None
+    # Row-based slice: reader.get_slice(key)[start:end] gives rows
+    # [start:end] without loading the full tensor.
     t = reader.get_slice(key)[start:end]
     if kind == "tv":
         return t.to(base_chunk.dtype).clone()
@@ -239,11 +357,13 @@ class TensorWriter:
         out_path: str,
         max_shard_size: int = 1_000_000_000,
         safe_serialization: bool = True,
+        flush_after_each: bool = False,
     ) -> None:
         os.makedirs(out_path, exist_ok=True)
         self.out_path = out_path
         self.max_shard_size = max_shard_size
         self.safe_serialization = safe_serialization
+        self.flush_after_each = flush_after_each
 
         self.shards_written = 0
         self.weight_map: Dict[str, str] = {}
@@ -273,6 +393,9 @@ class TensorWriter:
 
         self.current_shard[name] = tensor
         self.current_shard_size += tensor_size
+
+        if self.flush_after_each:
+            self._flush_current_shard()
 
     def _flush_current_shard(self) -> None:
         if not self.current_shard:

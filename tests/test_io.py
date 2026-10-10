@@ -73,19 +73,24 @@ def test_index_glob_fallback(tmp_path):
 
 
 def test_reader_clone_semantics(tmp_path):
+    """Direct-read reader: each ``get_tensor`` returns a fresh, independent
+    tensor (no shared in-memory cache), so mutations never leak across reads.
+    """
     d = str(tmp_path)
     _write_single_file(d, {"w": torch.randn(16)})
     idx = ShardedTensorIndex.from_dir(d)
     with ShardReader(idx) as r:
         t1 = r.get_tensor("w")
         t2 = r.get_tensor("w")
-        # same cached storage: no clone -> same data_ptr
-        assert t1.data_ptr() == t2.data_ptr()
+        # independent storage: distinct data_ptr, identical values
+        assert t1.data_ptr() != t2.data_ptr()
+        assert torch.equal(t1, t2)
         orig = t1.clone()  # capture the original before mutating
-        t1.add_(1.0)  # mutate the shared storage
+        t1.add_(1.0)  # mutate t1's own storage
         t3 = r.get_tensor("w")
-        assert torch.allclose(t3, t1)  # the mutation is visible
-        assert not torch.allclose(t3, orig)
+        # a fresh read is the original (mutation did not persist)
+        assert torch.allclose(t3, orig)
+        assert not torch.allclose(t3, t1)
         # a fresh reader re-reads the original bytes from disk
     with ShardReader(idx) as r2:
         t4 = r2.get_tensor("w")
