@@ -1,17 +1,17 @@
-"""Parity tests for the chunked merge path.
+"""Parity tests for the Chunk Merge path.
 
-Verifies that chunked-mode results match non-chunked-mode results
+Verifies that Chunk Merge results match standard-path results
 (rtol=2e-2, atol=1e-2) for all merge methods.
 
-Sparsify notes:
-  - The chunked path applies sparsify per-chunk (LOCAL), while the
-    non-chunked path applies it globally (GLOBAL). For magnitude /
+Chunk Merge parity notes:
+  - The Chunk Merge path applies sparsify per-chunk (LOCAL) for the
+    stochastic methods, while the standard path applies it globally (GLOBAL). For magnitude /
     magnitude_outliers this is an approximation (not exact parity).
   - For random / della_magprune / bs the per-chunk result is exact
     (per-element or per-block), but the stochastic methods (random,
     della) will differ between runs due to different random draws.
-  - Therefore, sparsify parity tests use density=1.0 (no sparsify)
-    to isolate the merge-logic correctness.
+  - Global methods (magnitude / magnitude_outliers) are masked from the
+    whole tensor in both paths, so they are compared exactly too.
 """
 
 import logging
@@ -52,7 +52,7 @@ def _run_merge(base, entries, key, readers, settings):
 # --------------------------------------------------------------------------- #
 @pytest.fixture
 def small_model(tmp_path):
-    """Create a tiny model dir (one tensor, 256 elements) for chunked testing."""
+    """Create a tiny model dir (one tensor, 256 elements) for Chunk Merge testing."""
     n = 256
     torch.manual_seed(42)
     base_t = torch.randn(n, dtype=torch.float32)
@@ -78,11 +78,11 @@ def small_model(tmp_path):
 # --------------------------------------------------------------------------- #
 # Parity tests (merge logic, no sparsify)
 # --------------------------------------------------------------------------- #
-class TestChunkedParity:
-    """Chunked result must match non-chunked result (merge logic)."""
+class TestChunkMergeParity:
+    """Chunk Merge result must match the standard path (merge logic)."""
 
     def _check_parity(self, base, entries, key, readers, settings_chunked):
-        # Non-chunked reference (density=1.0 → no sparsify)
+        # standard-path reference (density=1.0 → no sparsify)
         settings_ref = MergeSettings(
             merge_method=settings_chunked.merge_method,
             density=1.0,  # no sparsify
@@ -95,11 +95,11 @@ class TestChunkedParity:
             normalize=settings_chunked.normalize,
             lambda_=settings_chunked.lambda_,
             consensus=settings_chunked.consensus,
-            chunk_elements=None,  # force non-chunked
+            chunk_elements=None,  # force the standard path
         )
         ref = _run_merge(base, entries, key, readers, settings_ref)
 
-        # Chunked (density=1.0 → no sparsify)
+        # Chunk Merge (density=1.0 → no sparsify)
         settings_no_sparsify = MergeSettings(
             merge_method=settings_chunked.merge_method,
             density=1.0,
@@ -132,7 +132,7 @@ class TestChunkedParity:
 
         settings = MergeSettings(
             merge_method=MergeMethod.gta,
-            chunk_elements=64,  # 256 elements > 64 → chunked
+            chunk_elements=64,  # 256 elements > 64 → Chunk Merge
         )
         self._check_parity(base, entries, key, readers, settings)
 
@@ -169,8 +169,8 @@ class TestChunkedParity:
         )
         self._check_parity(base, entries, key, readers, settings)
 
-    def test_slerp_fallback(self, small_model):
-        """Slerp in chunked mode falls back to non-chunked (same result)."""
+    def test_slerp_falls_back_from_chunk_merge(self, small_model):
+        """Slerp falls back from Chunk Merge to the standard path (same result)."""
         base_dir, entries, key = small_model
         readers = self._make_readers(base_dir, entries, key)
         base = readers[base_dir].get_tensor(key).clone()
@@ -179,8 +179,8 @@ class TestChunkedParity:
             merge_method=MergeMethod.slerp,
             chunk_elements=64,
         )
-        # Slerp fallback: chunked mode uses the non-chunked path,
-        # so the result should be identical to a direct non-chunked run.
+        # Slerp falls back from Chunk Merge to the standard path,
+        # so the result should be identical to a direct standard-path run.
         result = _run_merge(base, entries, key, readers, settings)
         settings_ref = MergeSettings(
             merge_method=MergeMethod.slerp,
@@ -191,10 +191,10 @@ class TestChunkedParity:
 
 
 # --------------------------------------------------------------------------- #
-# Sparsify validity tests (chunked mask is valid, not necessarily equal)
+# Sparsify validity tests (the Chunk Merge mask is valid)
 # --------------------------------------------------------------------------- #
-class TestChunkedSparsifyValidity:
-    """Verify the chunked sparsify produces a valid mask (correct density)."""
+class TestChunkMergeSparsifyValidity:
+    """Verify Chunk Merge sparsify produces a valid mask (correct density)."""
 
     def _make_readers(self, base_dir, entries, key):
         readers = {base_dir: _make_reader(base_dir, key)}
@@ -202,11 +202,14 @@ class TestChunkedSparsifyValidity:
             readers[entry.dir] = _make_reader(entry.dir, key)
         return readers
 
-    def _run_chunked_with_sparsify(self, base, entries, key, readers, settings):
-        return _run_merge(base, entries, key, readers, settings)
+    def _run_chunk_merge_with_sparsify(self, base_dir, entries, key, readers, settings):
+        """Run the Chunk Merge path (base=None, chunks streamed from disk)."""
+        return merge_tensor(
+            None, entries, key, readers, settings, base_reader=readers[base_dir]
+        )
 
     def test_magnitude_mask_valid(self, small_model):
-        """Chunked magnitude sparsify keeps ~density fraction of elements."""
+        """Chunk Merge magnitude sparsify keeps ~density fraction of elements."""
         base_dir, entries, key = small_model
         readers = self._make_readers(base_dir, entries, key)
         base = readers[base_dir].get_tensor(key).clone()
@@ -218,13 +221,13 @@ class TestChunkedSparsifyValidity:
             n=64,
             chunk_elements=64,
         )
-        result = self._run_chunked_with_sparsify(base, entries, key, readers, settings)
+        result = self._run_chunk_merge_with_sparsify(base_dir, entries, key, readers, settings)
         # The result should be finite and have the right shape
         assert result.shape == base.shape
         assert torch.isfinite(result).all()
 
     def test_random_mask_valid(self, small_model):
-        """Chunked random sparsify produces a finite result."""
+        """Chunk Merge random sparsify produces a finite result."""
         base_dir, entries, key = small_model
         readers = self._make_readers(base_dir, entries, key)
         base = readers[base_dir].get_tensor(key).clone()
@@ -236,12 +239,12 @@ class TestChunkedSparsifyValidity:
             n=64,
             chunk_elements=64,
         )
-        result = self._run_chunked_with_sparsify(base, entries, key, readers, settings)
+        result = self._run_chunk_merge_with_sparsify(base_dir, entries, key, readers, settings)
         assert result.shape == base.shape
         assert torch.isfinite(result).all()
 
     def test_bs_mask_valid(self, small_model):
-        """Chunked BS sparsify produces a finite result."""
+        """Chunk Merge BS sparsify produces a finite result."""
         base_dir, entries, key = small_model
         readers = self._make_readers(base_dir, entries, key)
         base = readers[base_dir].get_tensor(key).clone()
@@ -254,13 +257,13 @@ class TestChunkedSparsifyValidity:
             m=256,
             chunk_elements=64,
         )
-        result = self._run_chunked_with_sparsify(base, entries, key, readers, settings)
+        result = self._run_chunk_merge_with_sparsify(base_dir, entries, key, readers, settings)
         assert result.shape == base.shape
         assert torch.isfinite(result).all()
 
 
-class TestChunkedConsensusAndSparsify:
-    """Chunked mode must reproduce the non-chunked result exactly.
+class TestChunkMergeConsensusAndSparsify:
+    """Chunk Merge must reproduce the standard-path result exactly.
 
     The consensus divisor pass re-reads only the chunk's rows, and the
     global (magnitude / magnitude_outliers) mask is decided from the whole
@@ -313,9 +316,9 @@ class TestChunkedConsensusAndSparsify:
         b = merge_tensor(None, entries, key, readers, chunked, base_reader=readers[base_dir])
         torch.testing.assert_close(a, b, rtol=0, atol=0)
 
-    def test_missing_tensor_in_chunked_mode(self, small_model, tmp_path):
+    def test_missing_tensor_in_chunk_merge(self, small_model, tmp_path):
         base_dir, entries, key = small_model
-        # drop the tensor from the second TV: chunked mode must skip it, not crash
+        # drop the tensor from the second TV: Chunk Merge must skip it, not crash
         missing_dir = str(tmp_path / "tv_missing")
         entries2 = [
             entries[0],

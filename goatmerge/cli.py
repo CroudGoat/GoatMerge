@@ -245,7 +245,13 @@ def main(argv=None) -> int:
     pm.add_argument("--no-rescale", action="store_true", default=None)
     pm.add_argument("--no-normalize", action="store_true", default=None)
     pm.add_argument("--lambda", dest="lambda_", type=float, default=None)
-    pm.add_argument("--chunk-elements", type=int, default=None)
+    pm.add_argument(
+        "--chunk-elements",
+        type=int,
+        default=None,
+        help="Chunk Merge: process tensors larger than N elements in row chunks "
+             "(O(S) + O(chunk) peak RAM instead of O(S) per accumulator)",
+    )
     pm.add_argument("--skip-fingerprint-check", action="store_true", default=None)
     pm.set_defaults(func=cmd_merge)
 

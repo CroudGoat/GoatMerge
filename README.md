@@ -12,7 +12,7 @@ numerical parity with it.
 - **No `torch.stack`** — deltas are streamed one at a time and accumulated in place
 - **Peak RAM ≈ 5–7 S** (S = largest tensor bytes); measured at **1.06 S**
 - **Numerical parity with mergekit GTA** — rtol = 2e-2, atol = 1e-2 on bf16
-- **Chunked mode** — handles tensors of any size in O(S) + O(chunk) memory
+- **Chunk Merge** — merges tensors of any size in O(S) + O(chunk) memory, with results identical to the standard path
 - **HF-sharded safetensors** — reads and writes the standard HuggingFace layout
 - **Task-vector extraction and reuse** — no re-reading of source models
 - **Base fingerprint verification** — refuses TVs extracted against another base
@@ -34,7 +34,7 @@ identity `(acc + M·l1)/2`, so no k-sized mask tensor is ever materialized.
 | Delta handling | Streams one at a time | `torch.stack` over all deltas |
 | Peak RAM (k TVs, 1 tensor) | ≈ 5–7 S | (4k+4) S – (6k+7) S |
 | Consensus | Identity `(acc + M·l1)/2` | Full mask multiply over all weighted deltas |
-| Very large tensors | Chunked: O(S) + O(chunk) | All deltas resident |
+| Very large tensors | Chunk Merge: O(S) + O(chunk) | All deltas resident |
 | I/O | HF-sharded safetensors | HF-sharded safetensors |
 
 ### Benchmark (3 × 300 MB bf16 tensors, consensus=sum)
@@ -147,7 +147,7 @@ already present in the local HF cache.
 | `--no-rescale` | false | Disable norm re-normalization after sparsification |
 | `--no-normalize` | false | Disable divisor normalization |
 | `--lambda` | `1.0` | Scale applied to the mixed delta |
-| `--chunk-elements` | (none) | Chunk tensors above this many elements |
+| `--chunk-elements` | (none) | Chunk Merge: process tensors above this many elements in row chunks |
 | `--skip-fingerprint-check` | false | Skip the base fingerprint comparison |
 | `-c, --config` | (none) | YAML recipe file (see below) |
 
@@ -291,22 +291,23 @@ result = base + mixed / divisor        divisor = weight sum of sign-matching TVs
 ```
 
 `divisor` is per element, so it is computed in a second streamed pass over
-the deltas. In chunked mode that second pass re-reads **only the chunk's row
+the deltas. In Chunk Merge that second pass re-reads **only the chunk's row
 range**, so a full delta is never resident.
 
-### Chunked mode
+### Chunk Merge
 
-With `--chunk-elements N` (or `chunk_elements` in YAML), each tensor larger
-than N elements is processed in row chunks: load from disk, accumulate, write
-into a pre-allocated output buffer. Peak RAM becomes **O(S) + O(chunk)**
-(S is the output tensor itself and cannot be avoided).
+**Chunk Merge** is the name of the chunked merge path. With
+`--chunk-elements N` (or `chunk_elements` in YAML), each tensor larger than N
+elements is processed in row chunks: load from disk, accumulate, write into a
+pre-allocated output buffer. Peak RAM becomes **O(S) + O(chunk)** (S is the
+output tensor itself and cannot be avoided).
 
 - Global sparsification (`magnitude`, `magnitude_outliers`) scans the tensor
   once to obtain thresholds and tie budgets in O(1) memory, then applies them
   per chunk
 - The consensus divisor pass re-reads only the chunk's rows
 - Stochastic masks are seeded per chunk, so both passes agree
-- The result is **identical** to the non-chunked path
+- The result is **identical** to the standard path
 - `slerp` depends on a global norm and falls back to the non-chunked path
   with a warning
 
@@ -341,7 +342,7 @@ Peak / S:            1.06
 
 The measured value beats the 5–7 S worst-case budget because tensors are
 freed between passes (`l1` before the divisor pass, each `delta` right after
-it is accumulated). Chunked mode lowers the per-tensor peak further to
+it is accumulated). Chunk Merge lowers the per-tensor peak further to
 O(S) + O(chunk).
 
 Rough per-layer numbers:
@@ -365,7 +366,7 @@ python -m pytest tests/ -v
 - Numerical parity against mergekit GTA (rtol=2e-2, atol=1e-2)
 - Every sparsification method, including tie-heavy tensors
 - Kernel unit tests for linear / mixture / slerp / ties
-- Chunked-path equivalence across methods, consensus modes, and 1–3-D tensors
+- Chunk Merge equivalence across methods, consensus modes, and 1–3-D tensors
 - Fingerprint verification
 - I/O (sharded, single-shard, submatrix truncation)
 - Metadata envelope
@@ -385,13 +386,13 @@ goatmerge/
   inspect.py       # task-vector and merged-model inspection
   io.py            # ShardReader, TensorWriter, ShardedTensorIndex
   kernels.py       # linear / mixture / slerp / ties kernels
-  merge.py         # merge_model, merge_tensor (incl. the chunked path)
+  merge.py         # merge_model, merge_tensor (incl. Chunk Merge)
   merge_method.py  # MergeMethod and build_kernel dispatch
   metadata.py      # goatmerge.json provenance sidecar
   sparsify.py      # sparsification kernels, chunked variants, global masks
 tests/
   test_consensus_merge.py   # mergekit GTA parity and merge logic
-  test_chunked_merge.py     # chunked-path equivalence
+  test_chunk_merge.py       # Chunk Merge equivalence
   test_kernels.py           # kernel unit tests
   test_sparsify.py          # sparsification methods
   test_fingerprint.py       # fingerprint verification

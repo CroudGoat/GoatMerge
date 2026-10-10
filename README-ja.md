@@ -12,7 +12,7 @@ mergekit の GTA（Generalized Task Arithmetic）と数値パリティを保ち�
 - **`torch.stack` を使わない** — delta を 1 個ずつストリーミングして in-place 蓄積
 - **ピーク RAM ≈ 5–7 S**（S = 最大テンソルのバイト数）。実測では **1.06 S**
 - **mergekit GTA との数値パリティ** — bf16 テンソルで rtol = 2e-2, atol = 1e-2
-- **チャンク分割モード** — 数百億〜数千億パラメータ級の大テンソルを O(S) + O(chunk) で処理
+- **Chunk Merge（チャンク分割マージ）** — 数百億〜数千億パラメータ級の大テンソルを O(S) + O(chunk) で処理。結果は通常経路と完全一致
 - **HF シャード型 safetensors** — 標準的な HuggingFace 配置をそのまま読み書き
 - **タスクベクトルの事前抽出と再利用** — 抽出後はソースモデルを再読込しない
 - **ベース指紋検証** — 別のベースで作られた TV を誤って混ぜるのを防止
@@ -35,7 +35,7 @@ GoatMerge は delta を 1 個ずつストリームし、`acc` / `l1` / `c` と�
 | delta の扱い | 1 個ずつストリーミング | `torch.stack` で全件積み上げ |
 | ピーク RAM（k 個の TV、1 テンソル） | ≈ 5–7 S | (4k+4) S – (6k+7) S |
 | コンセンサス | 恒等式 `(acc + M·l1)/2` | weighted 全件のマスク積 |
-| 大テンソル | チャンク分割で O(S) + O(chunk) | 全件resident |
+| 大テンソル | Chunk Merge で O(S) + O(chunk) | 全件resident |
 | I/O | HF シャード型 safetensors | HF シャード型 safetensors |
 
 ### ベンチマーク（300 MB bf16 テンソル × 3 TV、consensus=sum）
@@ -152,7 +152,7 @@ HF リポジトリ ID を使えます。
 | `--no-rescale` | false | スパース化後のノーム再正規化をオフにする |
 | `--no-normalize` | false | 除数による正規化をオフにする |
 | `--lambda` | `1.0` | ミックスされた delta にかける倍率 |
-| `--chunk-elements` | なし | この要素数以上のテンソルをチャンク分割する |
+| `--chunk-elements` | なし | Chunk Merge: この要素数以上のテンソルを行チャンクに分割して処理 |
 | `--skip-fingerprint-check` | false | ベース指紋の照合をスキップする |
 | `-c, --config` | なし | YAML レシピファイル（後述） |
 
@@ -302,14 +302,16 @@ result = base + mixed / divisor        divisor = 符号一致 TV の重み和
 ```
 
 `divisor` は 1 要素ずつ求める必要があるため、delta を第 2 パスで
-ストリーミングし直して計算します。チャンク分割モードでは、この第 2 パスも
+ストリーミングし直して計算します。Chunk Merge では、この第 2 パスも
 **チャンクの行範囲だけ**を読み直すため、フルテンソルがresidentになることは
 ありません。
 
-### チャンク分割モード
+### Chunk Merge（チャンク分割マージ）
+
+**Chunk Merge** は、チャンク分割によるマージ経路の名称です。
 
 `--chunk-elements N`（または YAML の `chunk_elements`）を指定すると、
-1 テンソルが N 要素以下の行チャンクに分割されて処理されます。チャンクごとに
+1 テンソルが N 要素以下の行チャンクに分割されて処理されます。
 ディスクから読み込み → 蓄積 → 出力バッファへ書き込み、を繰り返すので、
 ピーク RAM は **O(S) + O(chunk)** になります（S は出力テンソル自体で回避
 不能）。
@@ -318,9 +320,9 @@ result = base + mixed / divisor        divisor = 符号一致 TV の重み和
   1 回スキャンして閾値とタイ数だけを求め（O(1) メモリ）、各チャンクに適用します
 - コンセンサスの除数はチャンクの行範囲だけ再読込します
 - 乱数ベースのスパース化はチャンクごとのシードで、パス間で常に同じマスクになります
-- 結果は非チャンク経路と**完全一致**します（同一カーネル・同一マスク）
-- `slerp` は全域ノームに依存するためチャンク分割に対応しておらず、
-  警告付きで非チャンク経路にフォールバックします
+- 結果は通常経路と**完全一致**します（同一カーネル・同一マスク）
+- `slerp` は全域ノームに依存するため Chunk Merge に対応しておらず、
+  警告とともに通常経路にフォールバックします
 
 ### I/O
 
@@ -354,7 +356,7 @@ Peak / S:           1.06
 
 最悪ケースの見積もり 5–7 S より小さくなるのは、パス間でテンソルを解放して
 いるためです（`l1` は除数計算前に解放、各 `delta` は蓄積直後に解放）。
-さらにチャンク分割モードを使えば、1 テンソルあたりのピークは
+さらに Chunk Merge を使えば、1 テンソルあたりのピークは
 O(S) + O(chunk) まで下がります。
 
 規模の目安（1 層あたり）:
@@ -378,7 +380,7 @@ python -m pytest tests/ -v
 - mergekit GTA との数値パリティ（rtol=2e-2, atol=1e-2）
 - スパース化の各方式、同値が多いテンソルでのチャンク一致
 - カーネル単体（linear / mixture / slerp / ties）
-- チャンク分割経路の一致（方式 × コンセンサス × 1〜3 次元テンソル）
+- Chunk Merge 経路の一致（方式 × コンセンサス × 1〜3 次元テンソル）
 - フィンガープリント照合
 - I/O（シャード型 / 単一シャード / サブ行列切り詠め）
 - メタデータエンベローブ
@@ -398,13 +400,13 @@ goatmerge/
   inspect.py       # TV・マージ結果の検査
   io.py            # ShardReader, TensorWriter, ShardedTensorIndex
   kernels.py       # linear / mixture / slerp / ties の各カーネル
-  merge.py         # merge_model, merge_tensor（チャンク分割経路を含む）
+  merge.py         # merge_model, merge_tensor（Chunk Merge 経路を含む）
   merge_method.py  # MergeMethod と build_kernel の分岐
    metadata.py      # goatmerge.json メタデータ
   sparsify.py      # スパース化カーネル、チャンク分割変種、大域マスク
 tests/
   test_consensus_merge.py   # mergekit GTA パリティとマージロジック
-  test_chunked_merge.py     # チャンク分割経路の一致
+  test_chunk_merge.py       # Chunk Merge 経路の一致
   test_kernels.py           # 各カーネルの単体テスト
   test_sparsify.py          # スパース化各方式
   test_fingerprint.py       # 指紋照合

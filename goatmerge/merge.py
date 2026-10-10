@@ -12,9 +12,17 @@ Peak resident memory is base + acc + l1 + c + 1 delta + sparsify temp
 
 Parity with mergekit GTA:
   - no consensus:  result = base + lambda * acc / sum(alpha_i)   (normalize)
-                   (bit-exact: same sequential add order as the reference)
+                    (bit-exact: same sequential add order as the reference)
   - consensus:     mixed = (acc + M*l1)/2  (exact masked-sum identity),
-                   divisor recomputed in a second streamed pass.
+                    divisor recomputed in a second streamed pass.
+
+Chunk Merge
+    For tensors larger than ``settings.chunk_elements`` the engine switches to
+    the Chunk Merge path: the tensor is processed in row chunks (load from
+    disk, accumulate, write back), so peak RAM becomes O(S) + O(chunk). The
+    result is identical to the standard path — global sparsification, the
+    consensus divisor, and stochastic masks are all computed per whole tensor
+    and applied chunk by chunk.
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ class MergeSettings:
     normalize: bool = True
     lambda_: float = 1.0
     consensus: ConsensusMethod = ConsensusMethod.none
+    # Chunk Merge: tensors above this many elements are merged in row chunks
     chunk_elements: Optional[int] = None
 
 
@@ -90,25 +99,26 @@ def merge_tensor(
     method's kernel, and finalizes. The method is selected by
     ``settings.merge_method`` (see :func:`build_kernel`).
 
-    In chunked mode (``settings.chunk_elements`` set and ``base.numel()``
-    exceeds it), the tensor is processed in flat chunks: each chunk is
+    Chunk Merge (``settings.chunk_elements`` set and ``base.numel()``
+    exceeds it): the tensor is processed in row chunks — each chunk is
     loaded from disk, accumulated independently, and written into a
     pre-allocated output buffer via slice assignment. Peak RAM is
-    O(S) + O(chunk) instead of O(6-7 S).
+    O(S) + O(chunk) instead of O(6-7 S), and the result equals the
+    standard path's.
 
-    When ``base`` is ``None`` (chunked mode), ``base_reader`` must be
+    When ``base`` is ``None`` (Chunk Merge), ``base_reader`` must be
     provided and base chunks are loaded from disk via ``get_slice``.
 
     Stochastic sparsification (``random`` / ``della_magprune``) is seeded
-    from ``(key, source index)`` so every source gets the same mask in the
-    consensus second pass as it did in the first.
+    from ``(key, source index, chunk)`` so every source gets the same mask
+    in the consensus second pass as it did in the first.
     """
     if not entries:
         if base is not None:
             return base
         return None
 
-    # Chunked mode requires an explicit row budget; without one there is
+    # Chunk Merge requires an explicit row budget; without one there is
     # nothing to chunk by, so fall back to a full-tensor merge.
     if base is None and settings.chunk_elements is None:
         if base_reader is None:
@@ -118,8 +128,8 @@ def merge_tensor(
             )
         base = base_reader.get_tensor(key).clone()
 
-    # Determine if we're in chunked mode.
-    # If base is None, we're in chunked mode by definition.
+    # Decide whether to use the Chunk Merge path.
+    # If base is None, Chunk Merge is the only option by definition.
     if base is None:
         chunked = True
     else:
@@ -150,10 +160,10 @@ def merge_tensor(
             del delta
         return kernel.finish(entries, readers, key)
 
-    # --- Chunked path ---
+    # --- Chunk Merge path ---
     if settings.merge_method == MergeMethod.slerp:
         logger.warning(
-            "slerp does not support chunked mode; falling back to full tensor"
+            "slerp does not support Chunk Merge; falling back to full tensor"
         )
         # Fall back to the standard path (base is already loaded)
         if base is None:
@@ -179,7 +189,7 @@ def merge_tensor(
             del delta
         return kernel.finish(entries, readers, key)
 
-    # Determine shape/dtype. If base is None (chunked mode), get it from the reader.
+    # Determine shape/dtype. If base is None (Chunk Merge), get it from the reader.
     if base is None:
         # Get shape without loading the full tensor.
         slice_obj = base_reader.get_slice(key)
@@ -287,7 +297,7 @@ def merge_tensor(
         full[start:end] = result_chunk
         del result_chunk, base_chunk, kernel
     # Return the full merged tensor (the caller writes it), matching the
-    # non-chunked path's contract. Peak RAM is O(S) (the full tensor) plus
+    # standard path's contract. Peak RAM is O(S) (the full tensor) plus
     # O(chunk) for the per-chunk accumulators.
     return full
 
@@ -320,7 +330,7 @@ def merge_model(
     try:
         base_reader = readers[Path(base_dir)]
         for i, key in enumerate(tensor_names):
-            # In chunked mode, don't load the full base tensor.
+            # In Chunk Merge mode, don't load the full base tensor.
             # Instead, pass base=None and let merge_tensor load chunks from disk.
             chunked = (
                 settings.chunk_elements is not None
