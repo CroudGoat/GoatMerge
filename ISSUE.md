@@ -79,7 +79,9 @@ result = (base + mixed).to(base.dtype)
 
 ### 2.8 メタデータエンベローブ
 
-- マージ結果に `metadata.json`（base、TV 一覧、settings、fingerprint）
+- マージ結果に `goatmerge.json`（base、TV 一覧、settings、fingerprint）。
+  HF の `config.json` はベースからコピーされるため、出力はそのまま
+  `transformers` で読み込める
 - `inspect` で確認可能
 
 ### 2.9 比較ベンチマーク（GoatMerge vs mergekit GTA）

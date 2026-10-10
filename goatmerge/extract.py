@@ -10,8 +10,6 @@ import logging
 from pathlib import Path
 from typing import List
 
-import torch
-
 from .fingerprint import compute_base_fingerprint
 from .io import ShardReader, ShardedTensorIndex, TensorWriter
 from .metadata import build_metadata, write_metadata
@@ -40,7 +38,6 @@ def extract_task_vector(
 
     tensor_names: List[str] = []
     skipped: List[str] = []
-    base_dtype: torch.dtype | None = None
 
     try:
         for key in base_index.keys():
@@ -67,7 +64,6 @@ def extract_task_vector(
             delta = s.to(b.dtype) - b
             writer.save_tensor(key, delta)
             tensor_names.append(key)
-            base_dtype = b.dtype
     finally:
         base_reader.close()
         src_reader.close()
@@ -82,8 +78,6 @@ def extract_task_vector(
     meta = build_metadata(
         base_model=str(base_dir),
         source_model=str(source_dir),
-        dtype=base_dtype,
-        tensor_names=tensor_names,
         base_fingerprint=fingerprint,
     )
     write_metadata(out_dir, meta)

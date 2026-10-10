@@ -19,6 +19,8 @@ Methods:
 
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 
 from .consensus import ConsensusAccumulator, ConsensusMethod
@@ -42,7 +44,7 @@ class LinearKernel(MergeKernel):
         _weighted(delta, weight)
         self.acc.add_(delta)
 
-    def finish(self, entries, readers, key: str) -> torch.Tensor:
+    def finish(self, entries, readers, key: str, start: Optional[int] = None, end: Optional[int] = None, chunk: int = 0, masker=None) -> torch.Tensor:
         return (self.base + self.acc).to(self.base.dtype)
 
 
@@ -59,7 +61,7 @@ class MixtureKernel(MergeKernel):
         self.acc.add_(delta)
         self.wsum += weight
 
-    def finish(self, entries, readers, key: str) -> torch.Tensor:
+    def finish(self, entries, readers, key: str, start: Optional[int] = None, end: Optional[int] = None, chunk: int = 0, masker=None) -> torch.Tensor:
         mixed = self.acc
         if abs(self.wsum) < 1e-8:
             self.wsum = 1.0
@@ -81,39 +83,53 @@ class SlerpKernel(MergeKernel):
         _weighted(delta, weight)
         self.acc.add_(delta)
 
-    def finish(self, entries, readers, key: str) -> torch.Tensor:
-        """Spherical-linear interpolation in the base dtype (bf16).
+    def finish(self, entries, readers, key: str, start: Optional[int] = None, end: Optional[int] = None, chunk: int = 0, masker=None) -> torch.Tensor:
+        """Canonical SLERP between ``v1 = base`` and ``v2 = base + acc``.
 
-        Computes the SLERP entirely in bf16 to avoid allocating float32
-        temporaries (4–5 full-size copies). The result is already in the
-        base dtype, so no final cast is needed.
+        Follows the reference (mergekit ``slerp``): normalize both vectors, take
+        the dot of the *normalized* vectors, and interpolate with
+
+            s0 = sin(theta - t*theta) / sin(theta)
+            s1 = sin(t*theta) / sin(theta)
+            result = s0 * v1 + s1 * v2
+
+        so ``t = 1`` returns ``v2`` exactly. Near-parallel vectors fall back to
+        a linear interpolation. Only one full-size temporary is allocated
+        (``v2``); the interpolation is applied to it in place.
         """
         t = 1.0
         v1 = self.base
-        v2 = self.base + self.acc
+        v2 = self.base + self.acc  # single O(S) temporary, then reused
         n1 = v1.norm().clamp_min(1e-8)
         n2 = v2.norm().clamp_min(1e-8)
-        u1 = v1 / n1
-        u2 = v2 / n2
-        cos_theta = (u1 * u2).sum() / (n1 * n2)
-        cos_theta = cos_theta.clamp(-1.0, 1.0)
-        theta = torch.acos(cos_theta)
-        if theta < 1e-8:
-            return (self.base + self.acc).to(self.base.dtype)
-        s1 = torch.sin(t * theta)
-        s2 = torch.sin((1.0 - t) * theta)
-        direction = (u1 * s1 + u2 * s2) / torch.sin(theta)
-        result = direction * n2
-        return result.to(self.base.dtype)
+        # cos(theta) of the normalized vectors, without materializing u1/u2
+        dot = torch.dot(v1.reshape(-1), v2.reshape(-1)) / (n1 * n2)
+        dot = dot.clamp(-1.0, 1.0)
+        theta = torch.acos(dot)
+        theta_f = float(theta)
+        if theta_f < 1e-8 or float(torch.sin(theta)) < 1e-8:
+            # (near-)identical directions: nothing to interpolate
+            return v2.to(self.base.dtype)
+        if float(dot) > 0.9995:
+            # colinear: linear interpolation (stable where slerp is not)
+            s0, s1 = 1.0 - t, t
+        else:
+            s0 = float(torch.sin(theta - t * theta)) / float(torch.sin(theta))
+            s1 = float(torch.sin(t * theta)) / float(torch.sin(theta))
+        v2.mul_(s1)
+        v2.add_(v1, alpha=s0)
+        return v2.to(self.base.dtype)
 
 
 class TiesKernel(MergeKernel):
     """TIES: keep the elements whose weighted-delta signs agree with the
     majority, averaged over the agreeing sources.
 
-    Reuses the sign-consensus accumulators (``acc`` / ``l1`` / ``c``) but
-    normalizes by the per-element *agreement count* ``(|c| + 1) / 2`` instead
-    of the weight sum, so it is a single pass (no second streamed pass).
+    Reuses the sign-consensus accumulators (``acc`` / ``l1`` / ``c`` / ``nz``)
+    but normalizes by the per-element *agreement count* instead of the weight
+    sum, so it is a single pass (no second streamed pass). For ``nz`` sources
+    with a non-zero effective sign and sign-sum ``c``, the number agreeing
+    with the majority sign is ``(nz + |c|) / 2``.
     """
 
     def __init__(self, base: torch.Tensor, settings) -> None:
@@ -123,13 +139,14 @@ class TiesKernel(MergeKernel):
     def accumulate(self, delta: torch.Tensor, weight: float) -> None:
         self._acc.accumulate(delta, weight)
 
-    def finish(self, entries, readers, key: str) -> torch.Tensor:
+    def finish(self, entries, readers, key: str, start: Optional[int] = None, end: Optional[int] = None, chunk: int = 0, masker=None) -> torch.Tensor:
         acc = self._acc
         base = self.base
         mixed = acc.masked_sum_inplace()
         del acc.l1
+        acc.l1 = None
         c = acc.c
-        divisor = (c.abs().to(base.dtype) + 1) / 2
+        divisor = (c.abs().to(base.dtype) + acc.nz.to(base.dtype)) / 2
         divisor[divisor == 0] = 1
         mixed.div_(divisor)
         return (base + mixed).to(base.dtype)

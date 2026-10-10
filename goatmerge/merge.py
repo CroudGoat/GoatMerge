@@ -27,9 +27,24 @@ from typing import List, Optional
 import torch
 
 from .consensus import ConsensusMethod
-from .io import ShardReader, ShardedTensorIndex, TensorWriter, load_delta, load_delta_chunk
+from .fingerprint import compute_base_fingerprint
+from .io import (
+    ShardReader,
+    ShardedTensorIndex,
+    TensorWriter,
+    copy_support_files,
+    load_delta,
+    load_delta_chunk,
+)
 from .merge_method import MergeMethod, build_kernel
-from .sparsify import SparsificationMethod, iter_chunk_ranges, sparsify_delta
+from .sparsify import (
+    GlobalMasker,
+    SparsificationMethod,
+    global_mask_params,
+    iter_chunk_ranges,
+    merge_generator,
+    sparsify_delta,
+)
 
 logger = logging.getLogger("goatmerge.merge")
 
@@ -83,11 +98,25 @@ def merge_tensor(
 
     When ``base`` is ``None`` (chunked mode), ``base_reader`` must be
     provided and base chunks are loaded from disk via ``get_slice``.
+
+    Stochastic sparsification (``random`` / ``della_magprune``) is seeded
+    from ``(key, source index)`` so every source gets the same mask in the
+    consensus second pass as it did in the first.
     """
     if not entries:
         if base is not None:
             return base
         return None
+
+    # Chunked mode requires an explicit row budget; without one there is
+    # nothing to chunk by, so fall back to a full-tensor merge.
+    if base is None and settings.chunk_elements is None:
+        if base_reader is None:
+            raise ValueError(
+                "merge_tensor requires `base` or `base_reader` when "
+                "chunk_elements is not set"
+            )
+        base = base_reader.get_tensor(key).clone()
 
     # Determine if we're in chunked mode.
     # If base is None, we're in chunked mode by definition.
@@ -101,7 +130,7 @@ def merge_tensor(
     if not chunked:
         # --- Standard path (unchanged) ---
         kernel = build_kernel(base, settings)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             delta = load_delta(base, entry.dir, entry.kind, key, readers)
             if delta is None:
                 continue
@@ -115,6 +144,7 @@ def merge_tensor(
                 epsilon=settings.epsilon,
                 rescale=settings.rescale,
                 chunk_elements=settings.chunk_elements,
+                generator=merge_generator(key, i),
             )
             kernel.accumulate(delta, entry.weight)
             del delta
@@ -129,7 +159,7 @@ def merge_tensor(
         if base is None:
             base = base_reader.get_tensor(key).clone()
         kernel = build_kernel(base, settings)
-        for entry in entries:
+        for i, entry in enumerate(entries):
             delta = load_delta(base, entry.dir, entry.kind, key, readers)
             if delta is None:
                 continue
@@ -143,6 +173,7 @@ def merge_tensor(
                 epsilon=settings.epsilon,
                 rescale=settings.rescale,
                 chunk_elements=settings.chunk_elements,
+                generator=merge_generator(key, i),
             )
             kernel.accumulate(delta, entry.weight)
             del delta
@@ -161,48 +192,98 @@ def merge_tensor(
         base_shape = base.shape
         base_dtype = base.dtype
 
-    # Row-based chunking: for a (R, C) tensor, chunk by rows so that
+    # Row-based chunking: for a (R, C1, ..., Ck) tensor, chunk by rows so that
     # base[start:end] and reader.get_slice(key)[start:end] are contiguous
-    # row ranges (no full-tensor load).
-    if len(base_shape) >= 2:
-        n_rows = base_shape[0]
-        n_cols = base_shape[1]
-    else:
-        n_rows = base_shape[0]
-        n_cols = 1
+    # row ranges (no full-tensor load). A "row" is everything after dim 0, so
+    # n_cols is the product of the trailing dims (not just shape[1]).
+    n_rows = base_shape[0]
+    n_cols = 1
+    for s in base_shape[1:]:
+        n_cols *= s
     rows_per_chunk = max(1, settings.chunk_elements // n_cols)
 
     # Pre-allocate the full output tensor once (O(S)) and fill each chunk
     # into it; write once at the end. Peak RAM is O(S) (the full tensor)
     # plus O(chunk) for the per-chunk accumulators.
     full = torch.empty(base_shape, dtype=base_dtype, device="cpu")
-    for start, end in iter_chunk_ranges(n_rows, rows_per_chunk):
-        # base chunk: load from disk (no full-tensor load).
+    ranges = list(iter_chunk_ranges(n_rows, rows_per_chunk))
+
+    def _base_rows(s0: int, e0: int) -> torch.Tensor:
         if base is None:
-            base_chunk = base_reader.get_slice(key)[start:end].clone()
+            return base_reader.get_slice(key)[s0:e0].clone()
+        return base[s0:e0].clone()
+
+    # Global-mask sparsification (magnitude / magnitude_outliers) is decided
+    # from the whole tensor, so its parameters are scanned once per source
+    # (O(1) RAM, straight from disk) and then applied chunk by chunk — in the
+    # accumulation pass *and* in the consensus divisor pass, so both use the
+    # very same mask.
+    mask_params: List[dict] = []
+    for entry in entries:
+        reader = readers.get(entry.dir) or readers[Path(entry.dir)]
+        if (
+            settings.method in (SparsificationMethod.magnitude, SparsificationMethod.magnitude_outliers)
+            and settings.density < 1
+            and key in reader.index.tensor_paths
+        ):
+            def _chunks(e=entry):
+                for s0, e0 in ranges:
+                    chunk = load_delta_chunk(
+                        _base_rows(s0, e0), e.dir, e.kind, key, readers, s0, e0
+                    )
+                    if chunk is None:
+                        return
+                    yield chunk.reshape(-1)
+
+            mask_params.append(
+                global_mask_params(
+                    settings.method,
+                    n_rows * n_cols,
+                    settings.density,
+                    settings.gamma,
+                    settings.rescale,
+                    _chunks,
+                )
+            )
         else:
-            base_chunk = base[start:end].clone()
+            mask_params.append({"kind": "local"})
+    # one masker for the accumulation pass, one for the divisor pass: the two
+    # passes interleave chunk by chunk, so each needs its own running budgets
+    masker = GlobalMasker(mask_params)
+    masker_divisor = GlobalMasker(mask_params)
+
+    for chunk_idx, (start, end) in enumerate(ranges):
+        # base chunk: load from disk (no full-tensor load).
+        base_chunk = _base_rows(start, end)
         kernel = build_kernel(base_chunk, settings)
-        for entry in entries:
+        masker.begin_pass(chunk_idx)
+        for i, entry in enumerate(entries):
             delta_chunk = load_delta_chunk(
                 base_chunk, entry.dir, entry.kind, key, readers, start, end
             )
             if delta_chunk is None:
                 continue
-            sparsify_delta(
-                delta_chunk,
-                settings.method,
-                density=settings.density,
-                n=settings.n,
-                m=settings.m,
-                gamma=settings.gamma,
-                epsilon=settings.epsilon,
-                rescale=settings.rescale,
-                chunk_elements=None,  # already a small chunk
-            )
+            if not masker.apply(i, delta_chunk):
+                # per-chunk mask (random / della / bs): identical in both
+                # passes thanks to the deterministic per-chunk generator
+                sparsify_delta(
+                    delta_chunk,
+                    settings.method,
+                    density=settings.density,
+                    n=settings.n,
+                    m=settings.m,
+                    gamma=settings.gamma,
+                    epsilon=settings.epsilon,
+                    rescale=settings.rescale,
+                    chunk_elements=None,  # already a small chunk
+                    generator=merge_generator(key, i, chunk_idx),
+                )
             kernel.accumulate(delta_chunk, entry.weight)
             del delta_chunk
-        result_chunk = kernel.finish(entries, readers, key)
+        # the consensus divisor pass re-reads only this chunk's rows
+        result_chunk = kernel.finish(
+            entries, readers, key, start=start, end=end, chunk=chunk_idx, masker=masker_divisor
+        )
         full[start:end] = result_chunk
         del result_chunk, base_chunk, kernel
     # Return the full merged tensor (the caller writes it), matching the
@@ -258,8 +339,14 @@ def merge_model(
         # Flush the writer: staged tensors are only written to disk here.
         writer.finalize()
 
+    # Merge only rewrites weights: carry the base model's config / tokenizer
+    # files over so the output is directly loadable by transformers.
+    copied = copy_support_files(base_dir, out_dir)
+
     return {
         "num_tensors": len(tensor_names),
         "tensor_names": tensor_names,
         "skipped_tensors": skipped,
+        "base_fingerprint": compute_base_fingerprint(Path(base_dir)),
+        "support_files": copied,
     }

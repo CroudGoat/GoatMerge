@@ -8,6 +8,7 @@ from goatmerge.sparsify import (
     magnitude_mask,
     magnitude_mask_chunked,
     magnitude_outliers_mask,
+    magnitude_outliers_mask_chunked,
     sparsify_inplace,
 )
 
@@ -115,3 +116,37 @@ def test_sparsify_inplace_zero_density():
     t2 = t.clone()
     sparsify_inplace(t2, 0.0, SparsificationMethod.magnitude)
     assert torch.equal(t2, torch.zeros_like(t))
+
+
+def test_chunked_masks_match_on_tie_heavy_tensors():
+    """Ties must be filled from *global* strict counts: the chunked masks keep
+    exactly k / density*n elements even when many |values| are equal."""
+    torch.manual_seed(11)
+    t = torch.randint(0, 3, (4000,)).float()  # only 3 distinct magnitudes
+    for density in (0.25, 0.5, 0.9):
+        expected_n = int(density * t.numel())
+        got = magnitude_mask_chunked(t, density, 700)
+        assert int(got.sum()) == expected_n, (density, int(got.sum()), expected_n)
+        assert int(magnitude_mask(t, density).sum()) == expected_n
+    for density, gamma in ((0.5, 0.1), (0.3, 0.2), (0.25, 0.0)):
+        expected_n = int(density * t.numel())
+        got = magnitude_outliers_mask_chunked(t, density, gamma, 700)
+        assert int(got.sum()) == expected_n, (density, gamma, int(got.sum()), expected_n)
+
+
+def test_chunked_masks_match_continuous_tensors():
+    torch.manual_seed(12)
+    t = torch.randn(4096)
+    assert torch.equal(magnitude_mask(t, 0.3), magnitude_mask_chunked(t, 0.3, 512))
+    assert torch.equal(
+        magnitude_outliers_mask(t, 0.5, 0.1),
+        magnitude_outliers_mask_chunked(t, 0.5, 0.1, 512),
+    )
+    assert torch.equal(bs_mask(t, 8, 32), bs_mask_chunked(t, 8, 32, 512))
+
+
+def test_k_uses_truncation_like_mergekit():
+    """mergekit uses int(density * n) (truncation), not round()."""
+    torch.manual_seed(13)
+    t = torch.randn(55)
+    assert int(magnitude_mask(t, 0.1).sum()) == int(0.1 * 55)

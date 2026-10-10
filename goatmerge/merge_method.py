@@ -23,7 +23,7 @@ inside ``build_kernel`` avoid an import cycle with the kernel modules.
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
@@ -48,10 +48,12 @@ class MergeKernel:
       - ``__init__(base, settings)``: allocate per-element accumulators in the
         base dtype (S bytes each).
       - ``accumulate(delta, weight)``: add one weighted delta in place.
-      - ``finish(entries, readers, key) -> torch.Tensor``: return ``base +
-        mixed``. ``entries`` / ``readers`` / ``key`` are passed so a kernel
-        that needs a second streamed pass (the GTA weight-sum divisor) can
-        re-read the deltas; single-pass kernels ignore them.
+      - ``finish(entries, readers, key, start=None, end=None) -> torch.Tensor``:
+        return ``base + mixed``. ``entries`` / ``readers`` / ``key`` are passed
+        so a kernel that needs a second streamed pass (the GTA weight-sum
+        divisor) can re-read the deltas; single-pass kernels ignore them.
+        ``start`` / ``end`` bound that re-read to a row range (chunked merge),
+        so no full-tensor delta is ever resident.
 
     No ``torch.stack``: at most one delta is resident at a time.
     """
@@ -63,7 +65,7 @@ class MergeKernel:
     def accumulate(self, delta: torch.Tensor, weight: float) -> None:
         raise NotImplementedError
 
-    def finish(self, entries, readers, key: str) -> torch.Tensor:
+    def finish(self, entries, readers, key: str, start: Optional[int] = None, end: Optional[int] = None, chunk: int = 0, masker=None) -> torch.Tensor:
         raise NotImplementedError
 
 

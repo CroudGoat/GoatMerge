@@ -42,7 +42,11 @@ def _ref_mixture(base: torch.Tensor, deltas: list[torch.Tensor], weights: list[f
 
 
 def _ref_slerp(base: torch.Tensor, deltas: list[torch.Tensor], weights: list[float]) -> torch.Tensor:
-    """Slerp between base and base + sum(w_i * delta_i), t=1.0."""
+    """Canonical SLERP between base and base + sum(w_i * delta_i), t=1.0.
+
+    Normalize both vectors, dot the *normalized* vectors, and interpolate
+    with s0*v1 + s1*v2 (the mergekit formulation).
+    """
     if not deltas:
         return base
     acc = torch.zeros_like(base)
@@ -50,20 +54,19 @@ def _ref_slerp(base: torch.Tensor, deltas: list[torch.Tensor], weights: list[flo
         acc += d * w
     t = 1.0
     v1 = base.float()
-    v2 = (base.float() + acc.float())
+    v2 = base.float() + acc.float()
     n1 = v1.norm().clamp_min(1e-8)
     n2 = v2.norm().clamp_min(1e-8)
     u1 = v1 / n1
     u2 = v2 / n2
-    cos_theta = (u1 * u2).sum() / (n1 * n2)
-    cos_theta = cos_theta.clamp(-1.0, 1.0)
-    theta = torch.acos(cos_theta)
+    dot = (u1 * u2).sum().clamp(-1.0, 1.0)
+    theta = torch.acos(dot)
     if theta < 1e-8:
         return (base + acc).to(base.dtype)
-    s1 = torch.sin(t * theta)
-    s2 = torch.sin((1.0 - t) * theta)
-    direction = (u1 * s1 + u2 * s2) / torch.sin(theta)
-    result = direction * n2
+    sin_theta = torch.sin(theta)
+    s0 = torch.sin(theta - t * theta) / sin_theta
+    s1 = torch.sin(t * theta) / sin_theta
+    result = s0 * v1 + s1 * v2
     return result.to(base.dtype)
 
 
@@ -74,25 +77,29 @@ def _ref_ties(base: torch.Tensor, deltas: list[torch.Tensor], weights: list[floa
       acc = sum(w_i * d_i),  l1 = sum(|w_i * d_i|),  c = sum(sign(w_i * d_i))
       M = +1 if c >= 0 else -1
       mixed = (acc + M * l1) / 2
-      divisor = (|c| + 1) / 2,  divisor[divisor==0] = 1
+      divisor = (nz + |c|) / 2  where nz = number of sources with a
+                 non-zero effective sign (the agreement count;
+                 divisor[divisor == 0] = 1)
       result = base + mixed / divisor
     """
     if not deltas:
         return base
     # Weighted deltas (bf16 * bf16 tensor multiply)
-    weighted = [d * w for d, w in zip(deltas, weights)]
+    weighted = [d * torch.tensor(w, dtype=base.dtype) for d, w in zip(deltas, weights)]
     # acc = sum of weighted deltas
     acc = sum(weighted, torch.zeros_like(base))
     # l1 = sum of |weighted deltas|
     l1 = sum([w.abs() for w in weighted], torch.zeros_like(base))
     # c = sum of sign(weighted deltas)
     c = sum([w.sign() for w in weighted], torch.zeros_like(base, dtype=torch.int8))
+    # nz = number of sources with a non-zero effective sign
+    nz = sum([(w.sign() != 0).to(base.dtype) for w in weighted], torch.zeros_like(base))
     # M = +1 if c >= 0 else -1
     M = torch.where(c >= 0, torch.ones_like(base), -torch.ones_like(base))
     # mixed = (acc + M * l1) / 2
     mixed = (acc + M * l1) / 2
-    # divisor = (|c| + 1) / 2  (bf16 division, matching the kernel)
-    divisor = (c.abs().to(base.dtype) + 1) / 2
+    # divisor = (nz + |c|) / 2  (bf16 division, matching the kernel)
+    divisor = (c.abs().to(base.dtype) + nz) / 2
     divisor[divisor == 0] = 1
     mixed = mixed / divisor
     return (base + mixed).to(base.dtype)
@@ -146,6 +153,19 @@ def test_slerp_kernel_matches_reference():
     expected = _ref_slerp(base, deltas, weights)
     assert result.shape == expected.shape
     torch.testing.assert_close(result.float(), expected.float(), rtol=2e-2, atol=1e-2)
+
+
+def test_slerp_t_one_returns_target():
+    """t = 1.0 must return ``base + sum(w_i * delta_i)`` exactly."""
+    base, deltas, weights = _make_tensors()
+    kernel = SlerpKernel(base, None)
+    for d, w in zip(deltas, weights):
+        kernel.accumulate(d.clone(), w)
+    result = kernel.finish([], {}, "test")
+    target = base.clone()
+    for d, w in zip(deltas, weights):
+        target += d * w
+    torch.testing.assert_close(result.float(), target.float(), rtol=2e-2, atol=1e-2)
 
 
 def test_ties_kernel_matches_reference():
@@ -224,4 +244,31 @@ def test_ties_all_same_sign():
     for d, w in zip(pos_deltas, weights):
         kernel.accumulate(d.clone(), w)
     result = kernel.finish([], {}, "test")
+    torch.testing.assert_close(result.float(), expected.float(), rtol=2e-2, atol=1e-2)
+
+
+def test_ties_negative_weights():
+    """Negative weights must not double-negate the sign count."""
+    base, deltas, _ = _make_tensors(seed=21)
+    weights = [0.7, -0.5, 0.3, -0.2]
+    kernel = TiesKernel(base, None)
+    for d, w in zip(deltas, weights):
+        kernel.accumulate(d.clone(), w)
+    result = kernel.finish([], {}, "test")
+    expected = _ref_ties(base, deltas, weights)
+    torch.testing.assert_close(result.float(), expected.float(), rtol=2e-2, atol=1e-2)
+
+
+def test_ties_sparse_deltas_zero_signs():
+    """Sparse deltas contain exact zeros: the divisor must be the agreement
+    count (nz + |c|) / 2, not (k + |c|) / 2."""
+    torch.manual_seed(9)
+    base = torch.randn(32, 32, dtype=torch.bfloat16)
+    deltas = [torch.randn(32, 32, dtype=torch.bfloat16) * (torch.rand(32, 32) > 0.7) for _ in range(3)]
+    weights = [0.6, 0.4, 0.5]
+    kernel = TiesKernel(base, None)
+    for d, w in zip(deltas, weights):
+        kernel.accumulate(d.clone(), w)
+    result = kernel.finish([], {}, "test")
+    expected = _ref_ties(base, deltas, weights)
     torch.testing.assert_close(result.float(), expected.float(), rtol=2e-2, atol=1e-2)

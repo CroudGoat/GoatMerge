@@ -21,6 +21,7 @@ from .kernels import LinearKernel, MixtureKernel, SlerpKernel, TiesKernel
 from .merge import ModelEntry, MergeSettings, merge_model, merge_tensor
 from .merge_method import MergeKernel, MergeMethod, build_kernel
 from .metadata import (
+    METADATA_NAME,
     build_metadata,
     build_merged_metadata,
     load_metadata,
@@ -63,6 +64,7 @@ __all__ = [
     "extract_task_vector",
     "inspect_dir",
     "load_metadata",
+    "METADATA_NAME",
     "magnitude_mask",
     "magnitude_mask_chunked",
     "magnitude_threshold",

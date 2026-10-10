@@ -15,11 +15,12 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import struct
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Mapping, Optional
+from typing import Dict, List, Mapping, Optional, Tuple
 
 import safetensors
 import safetensors.torch
@@ -128,7 +129,27 @@ class ShardReader:
         self.index = index
         self._handles: Dict[str, "safetensors.torch.safe_open"] = {}
         self._use_mmap = use_mmap
-        self._direct_cache: Dict[str, tuple] = {}  # key -> (dtype, shape, offset)
+        # shard filename -> (parsed safetensors header, header byte length)
+        self._header_cache: Dict[str, Tuple[dict, int]] = {}
+
+    def _shard_header(self, shard_name: str) -> Tuple[dict, int]:
+        """Cached ``(parsed safetensors header, header byte length)``.
+
+        The chunked merge path reads one row range at a time; re-opening and
+        re-parsing the (potentially large) shard header for every row read
+        dominated its cost, so the parsed header is cached here.
+        """
+        cached = self._header_cache.get(shard_name)
+        if cached is not None:
+            return cached
+        path = Path(self.index.base_path) / shard_name
+        with open(str(path), "rb") as f:
+            header_len = struct.unpack("<Q", f.read(8))[0]
+            f.seek(8)
+            header_json = f.read(header_len)
+        meta = json.loads(header_json)
+        self._header_cache[shard_name] = (meta, header_len)
+        return meta, header_len
 
     def _read_direct(self, key: str) -> torch.Tensor:
         """Read a tensor directly from disk without mmap."""
@@ -143,12 +164,9 @@ class ShardReader:
         offset and read only the needed bytes.
         """
         shard_name = self.index.shard_filename(key)
+        meta, header_len = self._shard_header(shard_name)
         path = Path(self.index.base_path) / shard_name
         with open(str(path), "rb") as f:
-            header_len = struct.unpack("<Q", f.read(8))[0]
-            f.seek(8)
-            header_json = f.read(header_len)
-            meta = json.loads(header_json)
             entry = meta[key]
             dtype_str = entry["dtype"]
             shape = tuple(entry["shape"])
@@ -245,12 +263,8 @@ class _DirectSlice:
     def _read_header_entry(self) -> dict:
         """Read the safetensors header entry for this key (no tensor data)."""
         shard_name = self._reader.index.shard_filename(self._key)
-        path = Path(self._reader.index.base_path) / shard_name
-        with open(str(path), "rb") as f:
-            header_len = struct.unpack("<Q", f.read(8))[0]
-            header_json = f.read(header_len)
-            meta = json.loads(header_json)
-            return meta[self._key]
+        meta, _ = self._reader._shard_header(shard_name)
+        return meta[self._key]
 
     def get_shape(self) -> list:
         if self._shape is None:
@@ -277,19 +291,18 @@ class _DirectSlice:
         raise TypeError("only slice indexing is supported")
 
 
-def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict):
-    """Load ``delta = W_i - base`` (``kind="model"``) or the stored TV (``kind="tv"``).
+def _prepare_delta(
+    t: torch.Tensor,
+    base: torch.Tensor,
+    entry_dir,
+    kind: str,
+    key: str,
+) -> Optional[torch.Tensor]:
+    """Shape-check ``t`` against ``base`` and convert it to a delta.
 
-    Returns ``None`` if the tensor is missing or size-incompatible. The
-    returned tensor owns its storage (cloned). ``entry_dir`` is a ``Path`` and
-    ``kind`` is ``"tv"`` or ``"model"`` (no ``ModelEntry`` import, so this stays
-    import-cycle-free).
+    ``entry_dir`` / ``key`` are only used for the log messages. Returns
+    ``None`` when the tensor is size-incompatible (caller skips it).
     """
-    reader = readers[entry_dir]
-    if key not in reader.index.tensor_paths:
-        logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
-        return None
-    t = reader.get_tensor(key)
     if t.shape != base.shape:
         # embed-style submatrix: truncate when the TV is a superset grid
         if (
@@ -312,6 +325,22 @@ def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict
     return t
 
 
+def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict):
+    """Load ``delta = W_i - base`` (``kind="model"``) or the stored TV (``kind="tv"``).
+
+    Returns ``None`` if the tensor is missing or size-incompatible. The
+    returned tensor owns its storage (cloned). ``entry_dir`` is a ``Path`` and
+    ``kind`` is ``"tv"`` or ``"model"`` (no ``ModelEntry`` import, so this stays
+    import-cycle-free).
+    """
+    reader = readers[entry_dir]
+    if key not in reader.index.tensor_paths:
+        logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
+        return None
+    t = reader.get_tensor(key)
+    return _prepare_delta(t, base, entry_dir, kind, key)
+
+
 def load_delta_chunk(
     base_chunk: torch.Tensor,
     entry_dir,
@@ -321,29 +350,61 @@ def load_delta_chunk(
     start: int,
     end: int,
 ) -> Optional[torch.Tensor]:
-    """Load a flat sub-range ``[start:end]`` of the tensor as a delta chunk.
+    """Load rows ``[start:end]`` of the tensor as a delta chunk.
 
-    Returns ``None`` if the tensor is missing. The returned tensor owns its
-    storage (cloned). Used by the chunked merge path to stream-load base and
-    delta chunks from disk without holding the full tensor.
+    Row ranges are read straight from the shard (no full-tensor load) and go
+    through the same shape checks as :func:`load_delta`, so a missing or
+    size-incompatible tensor is skipped rather than corrupting the merge.
+    Returns ``None`` when the tensor must be skipped.
     """
     reader = readers[entry_dir]
     if key not in reader.index.tensor_paths:
+        logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
         return None
-    # Row-based slice: reader.get_slice(key)[start:end] gives rows
-    # [start:end] without loading the full tensor.
     t = reader.get_slice(key)[start:end]
-    if kind == "tv":
-        return t.to(base_chunk.dtype).clone()
-    # model mode: delta = W_i - base_chunk
-    t = t.to(base_chunk.dtype).clone()
-    t.sub_(base_chunk)
-    return t
+    return _prepare_delta(t, base_chunk, entry_dir, kind, key)
 
 
 # --------------------------------------------------------------------------- #
 # Output writer: emits the exact HF sharded-safetensors layout.
 # --------------------------------------------------------------------------- #
+# Copied from the base model into a merged output so the result is directly
+# loadable by transformers. Weight files are never touched.
+SUPPORT_FILES = (
+    "config.json",
+    "generation_config.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+    "special_tokens_map.json",
+    "added_tokens.json",
+    "vocab.json",
+    "merges.txt",
+    "vocab.txt",
+    "chat_template.jinja",
+    "preprocessor_config.json",
+)
+
+
+def copy_support_files(base_dir, out_dir) -> List[str]:
+    """Copy the base model's non-weight config files into ``out_dir``.
+
+    Merging only rewrites weights, so the architecture config, generation
+    config, and tokenizer files are carried over unchanged. Missing files are
+    skipped. Returns the list of copied file names.
+    """
+    base_dir = Path(base_dir)
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    copied: List[str] = []
+    for name in SUPPORT_FILES:
+        src = base_dir / name
+        if not src.is_file():
+            continue
+        shutil.copyfile(src, out_dir / name)
+        copied.append(name)
+    return copied
+
+
 class TensorWriter:
     """Writes a model/task-vector as HF sharded safetensors.
 

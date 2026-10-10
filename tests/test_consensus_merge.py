@@ -15,7 +15,9 @@ fine for small tensors):
 GoatMerge must produce the same result while never stacking all deltas.
 """
 
+import json
 import os
+from pathlib import Path
 
 import safetensors.torch
 import torch
@@ -258,6 +260,34 @@ def test_parity_magnitude_outliers(tmp_path):
         _close(got[k], ref[k])
 
 
+def test_parity_consensus_negative_weights(tmp_path):
+    # negative weights: sign(alpha * delta) must not be double-negated in the
+    # count consensus, and the divisor must only cover present TVs
+    base_dir, tv1, tv2 = _fixture(tmp_path)
+    weights = [0.5, -0.7]
+    for consensus in (ConsensusMethod.sum, ConsensusMethod.count):
+        s = MergeSettings(density=1.0, consensus=consensus)
+        got = _goat_engine(base_dir, [tv1, tv2], weights, s)
+        ref = _ref_from_dirs(base_dir, [tv1, tv2], weights, s)
+        for k in got:
+            _close(got[k], ref[k])
+
+
+def test_parity_missing_tensor_no_consensus(tmp_path):
+    # no consensus: normalize by the weight sum of the TVs that actually
+    # contributed this tensor (mergekit semantics), not all entries
+    base_dir, tv1, tv2 = _fixture(tmp_path)
+    tv2b = str(tmp_path / "tv2nb")
+    t2 = _load_model_tensors(tv2)
+    _write_model_dir(tv2b, {k: v for k, v in t2.items() if k != "b"})
+
+    s = MergeSettings(density=1.0)
+    got = _goat_engine(base_dir, [tv1, tv2b], [0.5, 0.7], s)
+    ref = _ref_from_dirs(base_dir, [tv1, tv2b], [0.5, 0.7], s)
+    for k in got:
+        _close(got[k], ref[k])
+
+
 def test_parity_missing_tensor_skip(tmp_path):
     # tv2 lacks tensor "b": the engine must skip it for that tensor only.
     base_dir, tv1, tv2 = _fixture(tmp_path)
@@ -306,13 +336,16 @@ def test_end_to_end_cli_merge(tmp_path):
     )
     assert rc == 0
 
-    # output layout: single shard + config.json
+    # output layout: single shard + GoatMerge sidecar. config.json is *not*
+    # written (it belongs to the base model, which is copied when present).
     assert os.path.exists(os.path.join(out_dir, "model.safetensors"))
+    assert os.path.exists(os.path.join(out_dir, "goatmerge.json"))
+    assert not os.path.exists(os.path.join(out_dir, "config.json"))
     meta = load_metadata(out_dir)
     validate_metadata(meta)
     assert meta["model_type"] == "merged_model"
-    assert meta["num_tensors"] == 2
-    assert meta["skipped_tensors"] == []
+    assert meta["base_fingerprint"] == compute_base_fingerprint(base_dir)
+    assert [tv["dir"] for tv in meta["task_vectors"]] == [tv1, tv2]
 
     # values must match the reference GTA kernel on the same TVs
     s = MergeSettings(density=1.0, consensus=ConsensusMethod.sum)
@@ -321,6 +354,33 @@ def test_end_to_end_cli_merge(tmp_path):
     out_tensors = _load_model_tensors(out_dir)
     for k in got:
         _close(out_tensors[k], ref[k])
+
+
+def test_merged_output_is_transformers_loadable(tmp_path):
+    """The merged output keeps the base's HF config, so it stays loadable."""
+    base_dir, tv1, tv2 = _fixture(tmp_path)
+    (Path(base_dir) / "config.json").write_text(
+        json.dumps({"architectures": ["TestForCausalLM"], "model_type": "test"}),
+        encoding="utf-8",
+    )
+    (Path(base_dir) / "tokenizer_config.json").write_text("{}", encoding="utf-8")
+
+    out_dir = str(tmp_path / "merged")
+    assert cli_main(
+        [
+            "merge",
+            "--base", base_dir,
+            "--out", out_dir,
+            "--tv", f"{tv1}:0.5",
+        ]
+    ) == 0
+
+    # the base's config is carried over verbatim and not shadowed by GoatMerge
+    copied = json.loads((Path(out_dir) / "config.json").read_text(encoding="utf-8"))
+    assert copied["model_type"] == "test"
+    assert copied["architectures"] == ["TestForCausalLM"]
+    assert (Path(out_dir) / "tokenizer_config.json").is_file()
+    assert json.loads((Path(out_dir) / "goatmerge.json").read_text())["model_type"] == "merged_model"
 
 
 def test_fingerprint_gate_accepts_matching_base(tmp_path):

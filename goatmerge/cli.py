@@ -178,8 +178,7 @@ def cmd_merge(args) -> int:
         task_vectors=[
             {"dir": str(e.dir), "kind": e.kind, "weight": e.weight} for e in entries
         ],
-        tensor_names=summary["tensor_names"],
-        dtype=None,
+        base_fingerprint=summary.get("base_fingerprint"),
         merge_settings={
             "merge_method": settings.merge_method.value,
             "density": settings.density,
@@ -194,7 +193,6 @@ def cmd_merge(args) -> int:
             "consensus": settings.consensus.value,
             "chunk_elements": settings.chunk_elements,
         },
-        skipped_tensors=summary["skipped_tensors"],
     )
     write_metadata(Path(out_str), meta)
     print(json.dumps({"out": str(Path(out_str)), **summary}, indent=2))

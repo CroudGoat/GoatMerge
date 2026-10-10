@@ -4,62 +4,51 @@
 
 [日本語版はこちら](README-ja.md)
 
-Streaming task-arithmetic merge engine. Merges fine-tuned models (task vectors)
-into a base model with **no `torch.stack`**, peak RAM ≈ **5–7 S** (S = largest
-tensor bytes), and **numerical parity** with mergekit's Generalized Task
-Arithmetic (GTA).
+**GoatMerge** is a *streaming* task-arithmetic merge engine. It merges
+fine-tuned models (task vectors) into a base model without ever calling
+`torch.stack`, keeping peak memory far below mergekit's GTA while retaining
+numerical parity with it.
 
-## Key properties
+- **No `torch.stack`** — deltas are streamed one at a time and accumulated in place
+- **Peak RAM ≈ 5–7 S** (S = largest tensor bytes); measured at **1.06 S**
+- **Numerical parity with mergekit GTA** — rtol = 2e-2, atol = 1e-2 on bf16
+- **Chunked mode** — handles tensors of any size in O(S) + O(chunk) memory
+- **HF-sharded safetensors** — reads and writes the standard HuggingFace layout
+- **Task-vector extraction and reuse** — no re-reading of source models
+- **Base fingerprint verification** — refuses TVs extracted against another base
 
-| Property | GoatMerge | mergekit GTA |
+---
+
+## Why GoatMerge
+
+mergekit's GTA stacks every delta into a `(k, shape)` tensor with
+`torch.stack`. For a 400B-class model (S ≈ 1.7 GB) with k = 4 task vectors
+that alone peaks at **34–53 GB**, which does not fit on a single GPU.
+
+GoatMerge streams one delta at a time and derives the consensus from three
+accumulators — `acc`, `l1`, `c`. The masked sum is replaced by the exact
+identity `(acc + M·l1)/2`, so no k-sized mask tensor is ever materialized.
+
+| Aspect | GoatMerge | mergekit GTA |
 |---|---|---|
-| Stacks all deltas? | No — streams one delta at a time | Yes (`torch.stack`) |
+| Delta handling | Streams one at a time | `torch.stack` over all deltas |
 | Peak RAM (k TVs, 1 tensor) | ≈ 5–7 S | (4k+4) S – (6k+7) S |
-| Consensus (masked sum) | Exact identity `(acc + M·l1)/2` | `stacked · weights` then mask |
-| Sparsify | Before consensus (per delta) | Before consensus |
+| Consensus | Identity `(acc + M·l1)/2` | Full mask multiply over all weighted deltas |
+| Very large tensors | Chunked: O(S) + O(chunk) | All deltas resident |
 | I/O | HF-sharded safetensors | HF-sharded safetensors |
 
-## Comparison with mergekit
+### Benchmark (3 × 300 MB bf16 tensors, consensus=sum)
 
-### Memory (measured, 100 MB bf16 tensor, 2 TVs, consensus=sum)
+| Engine | Peak RSS | Incremental | Numerical parity |
+|---|---|---|---|
+| **GoatMerge** | 3394.6 MB | 3009.1 MB | max\|d\| = 0.0625 |
+| **mergekit GTA** | 7289.4 MB | 6903.8 MB | same |
 
-| | GoatMerge | mergekit GTA (theoretical) |
-|---|---|---|
-| Peak RSS | **105.6 MB** (1.06 × S) | **1.2 – 1.9 GB** (12 S – 19 S) |
-| Stacked tensor | Never materialized | `k × S` (200 MB for k=2) |
-| Per-delta temporaries | 1 delta at a time (100 MB) | All k deltas resident (200 MB) |
-| Accumulator bookkeeping | acc + l1 + c = 2.5 S | stacked + weighted + mask ≈ 3 S |
+GoatMerge peaks at roughly **47%** of mergekit's RSS, and at roughly **44%**
+when only the memory attributable to the merge itself is counted. See
+[`Benchmarks/RESULTS.md`](Benchmarks/RESULTS.md) for the methodology.
 
-For a 9 B-class model (S ≈ 1.8 GB per layer), GoatMerge peaks at
-≈ 2–4 GB per layer; mergekit peaks at ≈ 22–34 GB.
-
-### Speed
-
-GoatMerge streams each delta exactly once per pass and accumulates in place.
-There is no `torch.stack` allocation, no `stacked · weights` full-tensor
-multiply, and no second pass over all k deltas for the mask. The only
-second pass is the per-element `divisor` (consensus only), which is a
-single `add_` per delta.
-
-| Operation | GoatMerge | mergekit GTA |
-|---|---|---|
-| Load k deltas | k × (1 load) | k × (1 load) + 1 stack |
-| Weighted sum | k × (in-place `add_`) | 1 × (full `stacked · weights`) |
-| Mask (consensus) | in-place identity | 1 × (full mask multiply) |
-| Divisor | k × (in-place `add_`) | 1 × (full `weights · mask`) |
-
-The in-place accumulation avoids the O(k·S) temporary allocation that
-`torch.stack` + `stacked · weights` requires, and the consensus identity
-`(acc + M·l1)/2` replaces a full-tensor mask multiply with two in-place
-`add_`/`mul_` operations.
-
-### Numerical parity
-
-GoatMerge matches mergekit GTA within **rtol = 2e-2, atol = 1e-2** on
-bf16 tensors. The weighted product `δᵢ · αᵢ` is a bf16·bf16 tensor
-multiply (matching the reference `stacked · weights`), not a Python-float
-scalar `add_` — whose internal product precision diverges at near-tie
-elements.
+---
 
 ## Installation
 
@@ -67,187 +56,302 @@ elements.
 pip install -e .
 ```
 
-Requires Python ≥ 3.10, PyTorch, and `safetensors`.
+Requirements:
 
-## CLI
+- Python ≥ 3.10
+- PyTorch, `safetensors`
+- `pyyaml` (for YAML recipes)
+
+---
+
+## Quick start
+
+### 1. Extract task vectors (recommended)
+
+Compute the difference against the base model once and store it as a task
+vector. Later merges never read the source models again.
 
 ```bash
-# Merge two TV dirs into a base model
+goatmerge extract \
+  --base   /path/to/base_model \
+  --source /path/to/finetuned_model \
+  --out    /path/to/tv_jp
+```
+
+### 2. Merge
+
+```bash
 goatmerge merge \
   --base /path/to/base_model \
-  --tv /path/to/tv1 --weight 0.5 \
-  --tv /path/to/tv2 --weight 0.7 \
-  --out /path/to/output \
-  --consensus sum \
-  --normalize
-
-# Extract task vectors from a model pair
-goatmerge extract \
-  --base /path/to/base \
-  --model /path/to/finetuned \
-  --out /path/to/tv_dir
+  --tv /path/to/tv_jp:0.7 \
+  --tv /path/to/tv_math:0.5 \
+  --out /path/to/merged_model \
+  --consensus sum
 ```
 
-### YAML recipe
+Weights are given as `--tv DIR:WEIGHT` (the same syntax works for `--model`).
+Use `--model` to merge source models directly, in which case the delta is
+computed as `source − base` on the fly.
 
-Pass a YAML file with `-c` instead of typing every flag on the command line:
+### 3. Inspect the result
 
 ```bash
-goatmerge merge -c recipe.yaml
+goatmerge inspect --dir /path/to/merged_model
 ```
 
-**Minimal recipe** (the only required fields):
+Every task vector and merged model carries a `goatmerge.json` sidecar
+recording the base model, the task vectors, the applied settings, and a
+fingerprint. At merge time the fingerprint stored in each TV is compared with
+the fingerprint of the base you passed, and the merge is refused (exit code 3)
+when they disagree. Use `--skip-fingerprint-check` to bypass the check.
 
-```yaml
-base: /path/to/base_model
-out: /path/to/merged_output
-tv:
-  - dir: /path/to/tv1
-    weight: 0.7
+A merged model directory is **directly loadable by `transformers`**: the base
+model's `config.json` and tokenizer files are copied over automatically, since
+GoatMerge only rewrites weights and those files are unchanged.
+
+```
+merged_model/
+  model.safetensors           merged weights
+  config.json                 copied from the base model (HF model config)
+  tokenizer_config.json ...   copied when present in the base
+  goatmerge.json              GoatMerge metadata
 ```
 
-That's all you need. Everything else is optional and falls back to its
-default if omitted.
+> Keep your merge *recipes* in YAML (`goatmerge merge -c recipe.yaml`).
+> `goatmerge.json` is not a replacement for a recipe — it records what a
+> directory was produced from.
 
-**Full recipe** (every field, annotated):
+Model references may be a local directory or a HuggingFace repo id that is
+already present in the local HF cache.
 
-```yaml
-# --- Required ---
-base: /path/to/base_model        # base model directory (HF-sharded safetensors)
-out: /path/to/merged_output      # where the merged model is written
+---
 
-# --- Task vectors (at least one) ---
-tv:
-  - dir: /path/to/tv1            # task-vector directory
-    weight: 0.7                  # merge weight for this TV
-  - dir: /path/to/tv2
-    weight: 0.3
+## CLI reference
 
-# --- Source models (alternative to tv; at least one of tv/model) ---
-# model:
-#   - dir: /path/to/source_model
-#     weight: 0.5
-
-# --- Merge method ---
-merge_method: gta                # gta | linear | mixture | slerp | ties  (default: gta)
-
-# --- Consensus (masked-sum) ---
-consensus: sum                   # none | sum | count  (default: none)
-
-# --- Sparsification ---
-density: 1.0                     # 0 = skip, 1.0 = keep all (default: 1.0)
-method: null                     # null = no sparsify; l1 | l2 | gamma | topk
-n: 64                            # top-k count (default: 64)
-m: 256                           # block size (default: 256)
-gamma: 0.0                       # gamma threshold (default: 0.0)
-epsilon: 0.0                     # epsilon floor (default: 0.0)
-rescale: true                    # rescale norm after sparsify (default: true)
-
-# --- Normalization & scaling ---
-normalize: true                  # divide by per-element divisor (default: true)
-lambda: 1.0                      # scale factor on the mixed tensor (default: 1.0)
-
-# --- Chunked mode (for very large tensors) ---
-chunk_elements: null             # split tensor into chunks of this many elements
-
-# --- Fingerprint ---
-skip_fingerprint_check: false    # skip base fingerprint verification
-```
-
-CLI flags override the corresponding YAML values, so you can set a recipe
-as a baseline and tweak one value on the command line without editing the
-file.
-
-### Options
+### `merge`
 
 | Flag | Default | Description |
 |---|---|---|
-| `--base` | (required) | Base model directory (HF-sharded safetensors) |
-| `--tv` / `--model` | (≥1) | Task-vector dir(s) or source model dir(s) |
-| `--weight` | 1.0 | Merge weight per entry |
-| `--out` | (required) | Output directory |
-| `--merge-method` | `gta` | Merge algorithm: `gta` \| `linear` \| `mixture` \| `slerp` \| `ties` |
+| `--base` | required | Base model directory, or a cached HF repo id |
+| `--tv DIR:WEIGHT` | — | Task vector to merge (repeatable) |
+| `--model DIR:WEIGHT` | — | Source model to merge (repeatable) |
+| `--out` | required | Output directory |
+| `--merge-method` | `gta` | `gta` \| `linear` \| `mixture` \| `slerp` \| `ties` |
 | `--consensus` | `none` | `none` \| `sum` \| `count` |
-| `--normalize` | true | Divide by per-element divisor |
-| `--lambda` | 1.0 | Scale factor on the mixed tensor |
-| `--density` | 1.0 | Sparsify density (0 = skip) |
-| `--method` | (none) | Sparsify method: `l1` \| `l2` \| `gamma` \| `topk` |
-| `--n` | 64 | Top-k count for sparsify |
-| `--m` | 256 | Block size for sparsify |
-| `--gamma` | 0.0 | Gamma threshold |
-| `--epsilon` | 0.0 | Epsilon floor |
-| `--rescale` | true | Rescale norm after sparsify |
-| `--chunk-elements` | null | Split tensor into chunks of this size (chunked mode) |
+| `--density` | `1.0` | Sparsification density; `1.0` disables it |
+| `--method` | (none) | `magnitude` \| `random` \| `magnitude_outliers` \| `della_magprune` \| `bs` |
+| `--n` | `64` | Kept values per block for BS (n:m) |
+| `--m` | `256` | BS block size |
+| `--gamma` | `0.0` | Fraction dropped from the top by `magnitude_outliers` |
+| `--epsilon` | `0.0` | Probability spread for `della_magprune` |
+| `--no-rescale` | false | Disable norm re-normalization after sparsification |
+| `--no-normalize` | false | Disable divisor normalization |
+| `--lambda` | `1.0` | Scale applied to the mixed delta |
+| `--chunk-elements` | (none) | Chunk tensors above this many elements |
+| `--skip-fingerprint-check` | false | Skip the base fingerprint comparison |
+| `-c, --config` | (none) | YAML recipe file (see below) |
 
-## Architecture
+### `extract`
+
+| Flag | Default | Description |
+|---|---|---|
+| `--base` | required | Base model directory, or a cached HF repo id |
+| `--source` | required | Fine-tuned model directory, or a cached HF repo id |
+| `--out` | required | Where the task vector is written |
+
+### `inspect`
+
+| Flag | Default | Description |
+|---|---|---|
+| `--dir` | required | Task-vector or merged-model directory |
+
+---
+
+## YAML recipes
+
+Pass `-c recipe.yaml` to keep a merge configuration in a file. CLI flags
+override the YAML values, so a recipe can serve as a baseline with one value
+tweaked on the command line.
+
+**Minimal recipe** (only the required fields):
+
+```yaml
+base: /path/to/base_model
+out: /path/to/merged_model
+tv:
+  - dir: /path/to/tv_jp
+    weight: 0.7
+```
+
+**Full recipe**:
+
+```yaml
+# --- Required ---
+base: /path/to/base_model          # base model (HF-sharded safetensors)
+out: /path/to/merged_model         # output directory
+
+# --- Merge inputs (at least one of tv / model) ---
+tv:
+  - dir: /path/to/tv_jp            # task vector
+    weight: 0.7                    # merge weight
+  - dir: /path/to/tv_math
+    weight: 0.3
+# model:
+#   - dir: /path/to/source_model   # source model (delta computed on the fly)
+#     weight: 0.5
+
+# --- Merge method ---
+merge_method: gta                  # gta | linear | mixture | slerp | ties
+
+# --- Consensus ---
+consensus: sum                     # none | sum | count
+
+# --- Sparsification ---
+density: 1.0                       # 1.0 keeps everything
+method: null                       # null | magnitude | random | magnitude_outliers | della_magprune | bs
+n: 64                              # --n
+m: 256                              # --m
+gamma: 0.0                         # --gamma
+epsilon: 0.0                       # --epsilon
+no_rescale: false                  # true disables norm re-normalization
+no_normalize: false                # true disables divisor normalization
+lambda: 1.0                        # --lambda
+
+# --- Very large tensors ---
+chunk_elements: null               # --chunk-elements
+
+# --- Fingerprint check ---
+skip_fingerprint_check: false      # true skips the comparison
+```
+
+---
+
+## Merge methods
+
+| `merge_method` | Definition | Notes |
+|---|---|---|
+| `gta` | Task arithmetic, identical to mergekit GTA | Standard; numerical parity with mergekit |
+| `linear` | `base + Σ wᵢ·δᵢ` | Plain weighted sum |
+| `mixture` | `base + Σ wᵢ·δᵢ / Σ wᵢ` | Weighted average |
+| `slerp` | Spherical interpolation between `base` and `base + Σ wᵢ·δᵢ` | Returns `base + Σ wᵢ·δᵢ` at `t = 1` |
+| `ties` | Average over sources whose sign agrees with the majority | TIES-style sign pruning |
+
+Only `gta` has numerical parity with mergekit's method of the same name.
+`linear`, `mixture`, `slerp`, and `ties` are GoatMerge's own variants and
+differ from mergekit's same-named methods.
+
+### Sparsification methods
+
+Set with `--method`; disabled when `--density 1.0`. Sparsification is applied
+to each delta **before** the consensus.
+
+| `method` | Definition | Flags |
+|---|---|---|
+| `magnitude` | Keep the top `density` fraction by absolute value | — |
+| `magnitude_outliers` | Drop the top `gamma` and the bottom, keep the middle | `--gamma` |
+| `random` | Keep each element with probability `density` (DARE-style) | — |
+| `della_magprune` | Keep probability depends on the within-row magnitude rank | `--epsilon` |
+| `bs` | Keep the top `n` of every `m`-element block | `--n`, `--m` |
+
+Stochastic methods (`random`, `della_magprune`) are seeded deterministically
+from the tensor name, source, and chunk, so repeated runs and repeated
+passes over the same source always produce the same mask.
+
+---
+
+## Design
 
 ### Streaming kernel
 
-Per tensor, the engine streams each delta exactly once per pass:
+Per tensor, every delta is streamed exactly once per pass and accumulated as:
 
 ```
-acc  = Σᵢ αᵢ · δᵢ        (in place, base dtype)
-l1   = Σᵢ |αᵢ · δᵢ|     (in place, base dtype)
-c    = Σᵢ sign(αᵢ·δᵢ)   (int8, count method only)
+acc  = Σᵢ αᵢ · δᵢ         (base dtype, in place)
+l1   = Σᵢ |αᵢ · δᵢ|      (base dtype, in place; consensus only)
+c    = Σᵢ sign(αᵢ·δᵢ)    (int8; count consensus only)
 ```
 
-The weighted product `δᵢ · αᵢ` is a **bf16·bf16 tensor multiply** (matching
-the reference `stacked · weights`), not a Python-float scalar `add_` — whose
-internal product precision diverges at near-tie elements and flips the
-per-element majority sign.
+The weighted product `δᵢ · αᵢ` is a **bf16·bf16 tensor multiply**, matching the
+reference `stacked · weights`. A Python-float scalar `add_(alpha=...)` has
+different internal product precision and can flip the per-element majority
+sign at near-tie elements.
 
 ### Consensus identity
 
 ```
-mixed = (acc + M · l1) / 2,   M = +1 if (acc|c) ≥ 0 else −1
+mixed = (acc + M · l1) / 2      M = +1 if acc ≥ 0 else −1   (sum)
+                               M = +1 if c   ≥ 0 else −1    (count)
 ```
 
-Zeros contribute 0 in both forms, matching the reference mask which drops
-sign-0 elements. Only `divisor` (per-element weight sum over sign-matching
-TVs) requires a second streamed pass.
+Elements whose sign disagrees with the majority cancel out of this identity,
+so the masked sum never materializes a k-sized mask. The final result is
 
-### Sparsify
+```
+result = base + mixed / divisor        divisor = weight sum of sign-matching TVs
+```
 
-Applied **before** consensus, per delta. Uses `torch.topk` (not `argsort`)
-and widens bf16/fp16 to f32 for topk on CPU.
+`divisor` is per element, so it is computed in a second streamed pass over
+the deltas. In chunked mode that second pass re-reads **only the chunk's row
+range**, so a full delta is never resident.
+
+### Chunked mode
+
+With `--chunk-elements N` (or `chunk_elements` in YAML), each tensor larger
+than N elements is processed in row chunks: load from disk, accumulate, write
+into a pre-allocated output buffer. Peak RAM becomes **O(S) + O(chunk)**
+(S is the output tensor itself and cannot be avoided).
+
+- Global sparsification (`magnitude`, `magnitude_outliers`) scans the tensor
+  once to obtain thresholds and tie budgets in O(1) memory, then applies them
+  per chunk
+- The consensus divisor pass re-reads only the chunk's rows
+- Stochastic masks are seeded per chunk, so both passes agree
+- The result is **identical** to the non-chunked path
+- `slerp` depends on a global norm and falls back to the non-chunked path
+  with a warning
 
 ### I/O
 
-HF-sharded safetensors layout (`model.safetensors.index.json` +
-`model-XXXXX-of-NNNNN.safetensors`). Single shard → `model.safetensors`.
-Only one tensor is resident at a time; `get_tensor` returns a view that
-shares storage with the shard's cached copy — the caller must `.clone()`
-before mutating.
+The standard HF-sharded safetensors layout is read and written as-is
+(`model.safetensors.index.json` + `model-XXXXX-of-NNNNN.safetensors`, or a
+single `model.safetensors`). Only one tensor is resident at a time. Shard
+headers are parsed once per shard and cached in the `ShardReader`.
 
-## Peak RAM
+Row ranges are read by computing the byte offset from the safetensors header
+`data_offsets` — no mmap, and no full-tensor load.
+
+### Fingerprints
+
+A TV stores the fingerprint of the base it was extracted against (tensor
+names, shapes, dtypes, and a hash of an anchor tensor). At merge time this is
+recomputed and compared, so a TV extracted against a different base cannot
+be mixed in by accident.
+
+---
+
+## Peak memory
 
 Measured on a synthetic 100 MB bf16 tensor (2 TVs, consensus=sum):
 
 ```
 S (largest tensor):  100.0 MB
 Merge peak RSS:      105.6 MB
-Peak / S:            1.06  (target: 5–7)
+Peak / S:            1.06
 ```
 
-The streaming kernel is more memory-efficient than the 5–7 S worst-case
-budget because tensors are freed between passes (`l1` before `divisor`,
-each `delta` after accumulation).
+The measured value beats the 5–7 S worst-case budget because tensors are
+freed between passes (`l1` before the divisor pass, each `delta` right after
+it is accumulated). Chunked mode lowers the per-tensor peak further to
+O(S) + O(chunk).
 
-### Chunked mode (large tensors)
+Rough per-layer numbers:
 
-For tensors larger than `chunk_elements`, the merge is split into flat
-chunks of `chunk_elements` elements. Each chunk is loaded from disk,
-accumulated independently, and written into a pre-allocated output buffer
-via slice assignment. Peak RAM drops to **O(S) + O(chunk)** instead of
-O(6–7 S):
+| Model scale | S (bf16, per layer) | GoatMerge | mergekit GTA |
+|---|---|---|---|
+| 9B-class | ≈ 1.8 GB | ≈ 2–4 GB | ≈ 22–34 GB |
+| 400B-class | ≈ 1.7 GB | ≈ 2 GB | ≈ 34–53 GB (impractical on one GPU) |
 
-- `base` is a lazy slice (no full O(S) allocation)
-- Per-chunk: `base_chunk`, `delta_chunk`, `acc`/`l1`/`c` are O(chunk)
-- `out_flat` is O(S) (unavoidable — it IS the result)
-
-Set `chunk_elements` in the YAML recipe or `--chunk-elements` on the CLI.
-Slerp does not support chunked mode (global norm dependency) and falls
-back to the non-chunked path with a warning.
+---
 
 ## Testing
 
@@ -255,39 +359,45 @@ back to the non-chunked path with a warning.
 python -m pytest tests/ -v
 ```
 
-61 tests cover:
-- Streaming merge (no-consensus, consensus sum/count)
-- Sparsify (l1, l2, gamma, top-k)
+74 tests cover:
+
+- Streaming merge (no consensus / sum / count, negative weights, missing tensors)
+- Numerical parity against mergekit GTA (rtol=2e-2, atol=1e-2)
+- Every sparsification method, including tie-heavy tensors
+- Kernel unit tests for linear / mixture / slerp / ties
+- Chunked-path equivalence across methods, consensus modes, and 1–3-D tensors
 - Fingerprint verification
 - I/O (sharded, single-shard, submatrix truncation)
 - Metadata envelope
-- Numerical parity vs mergekit GTA (rtol=2e-2, atol=1e-2)
-- Chunked merge parity + sparsify validity
+
+---
 
 ## Files
 
 ```
 goatmerge/
-  __init__.py      # package
-  cli.py            # CLI entry point
-  consensus.py      # ConsensusAccumulator (streaming kernel)
-  extract.py        # TV extraction from model pairs
-  fingerprint.py    # Fingerprint verification
-  hf.py             # HF model-dir helpers
-  inspect.py        # Model inspection
-  io.py              # ShardReader, TensorWriter, ShardedTensorIndex
-  kernels.py         # Per-method merge kernels
-  merge.py            # merge_model, merge_tensor (incl. chunked path)
-  merge_method.py    # MergeMethod enum + build_kernel dispatch
-  metadata.py         # Metadata envelope
-  sparsify.py         # Sparsify kernels + chunked variants
+  __init__.py      # package init
+  cli.py           # CLI (extract / merge / inspect, YAML recipes)
+  consensus.py     # ConsensusAccumulator, GtaKernel (streaming kernel)
+  extract.py       # task-vector extraction (T = W_source − W_base)
+  fingerprint.py   # base fingerprint computation and verification
+  hf.py            # local / HF-cache model directory resolution
+  inspect.py       # task-vector and merged-model inspection
+  io.py            # ShardReader, TensorWriter, ShardedTensorIndex
+  kernels.py       # linear / mixture / slerp / ties kernels
+  merge.py         # merge_model, merge_tensor (incl. the chunked path)
+  merge_method.py  # MergeMethod and build_kernel dispatch
+  metadata.py      # goatmerge.json provenance sidecar
+  sparsify.py      # sparsification kernels, chunked variants, global masks
 tests/
-  test_consensus_merge.py   # Parity + merge tests
-  test_chunked_merge.py     # Chunked merge parity + validity
-  test_fingerprint.py
-  test_io.py
-  test_kernels.py           # Kernel unit tests
-  test_metadata.py
-  test_sparsify.py
-  measure_peak_ram.py       # Peak-RAM measurement
+  test_consensus_merge.py   # mergekit GTA parity and merge logic
+  test_chunked_merge.py     # chunked-path equivalence
+  test_kernels.py           # kernel unit tests
+  test_sparsify.py          # sparsification methods
+  test_fingerprint.py       # fingerprint verification
+  test_io.py                # I/O layer
+  test_metadata.py          # metadata sidecar
+  measure_peak_ram.py       # peak-RAM measurement
+bench_real_models.py        # benchmark on real cached models
+Benchmarks/                 # GoatMerge vs mergekit GTA results
 ```

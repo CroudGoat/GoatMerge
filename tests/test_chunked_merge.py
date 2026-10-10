@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 import torch
 
+from goatmerge.consensus import ConsensusMethod
 from goatmerge.merge import MergeSettings, ModelEntry, merge_tensor
 from goatmerge.io import ShardReader, ShardedTensorIndex
 from goatmerge.merge_method import MergeMethod
@@ -256,6 +257,93 @@ class TestChunkedSparsifyValidity:
         result = self._run_chunked_with_sparsify(base, entries, key, readers, settings)
         assert result.shape == base.shape
         assert torch.isfinite(result).all()
+
+
+class TestChunkedConsensusAndSparsify:
+    """Chunked mode must reproduce the non-chunked result exactly.
+
+    The consensus divisor pass re-reads only the chunk's rows, and the
+    global (magnitude / magnitude_outliers) mask is decided from the whole
+    tensor — so its parameters are scanned once and applied chunk by chunk.
+    """
+
+    def _make_readers(self, base_dir, entries):
+        readers = {base_dir: _make_reader(base_dir, "w")}
+        for entry in entries:
+            readers[entry.dir] = _make_reader(entry.dir, "w")
+        return readers
+
+    def _assert_same(self, base_dir, entries, key, readers, settings, chunk_elements=64):
+        base = readers[base_dir].get_tensor(key).clone()
+        ref = _run_merge(base, entries, key, readers, settings)
+        chunked = MergeSettings(**{**settings.__dict__, "chunk_elements": chunk_elements})
+        got = merge_tensor(None, entries, key, readers, chunked, base_reader=readers[base_dir])
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=1e-2)
+
+    def test_consensus_matches_full_tensor(self, small_model):
+        base_dir, entries, key = small_model
+        readers = self._make_readers(base_dir, entries)
+        for consensus in (ConsensusMethod.none, ConsensusMethod.sum, ConsensusMethod.count):
+            settings = MergeSettings(consensus=consensus)
+            self._assert_same(base_dir, entries, key, readers, settings)
+
+    def test_global_sparsify_matches_full_tensor(self, small_model):
+        base_dir, entries, key = small_model
+        readers = self._make_readers(base_dir, entries)
+        for method in (SparsificationMethod.magnitude, SparsificationMethod.magnitude_outliers):
+            for consensus in (ConsensusMethod.none, ConsensusMethod.sum):
+                for rescale in (True, False):
+                    settings = MergeSettings(
+                        method=method, density=0.5, gamma=0.1,
+                        consensus=consensus, rescale=rescale,
+                    )
+                    self._assert_same(base_dir, entries, key, readers, settings)
+
+    def test_random_sparsify_is_reproducible_across_passes(self, small_model):
+        """The consensus divisor pass must reuse the accumulation pass's mask."""
+        base_dir, entries, key = small_model
+        readers = self._make_readers(base_dir, entries)
+        base = readers[base_dir].get_tensor(key).clone()
+        settings = MergeSettings(
+            method=SparsificationMethod.random, density=0.5,
+            consensus=ConsensusMethod.sum,
+        )
+        chunked = MergeSettings(**{**settings.__dict__, "chunk_elements": 64})
+        a = merge_tensor(None, entries, key, readers, chunked, base_reader=readers[base_dir])
+        b = merge_tensor(None, entries, key, readers, chunked, base_reader=readers[base_dir])
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
+
+    def test_missing_tensor_in_chunked_mode(self, small_model, tmp_path):
+        base_dir, entries, key = small_model
+        # drop the tensor from the second TV: chunked mode must skip it, not crash
+        missing_dir = str(tmp_path / "tv_missing")
+        entries2 = [
+            entries[0],
+            ModelEntry(dir=Path(missing_dir), kind="tv", weight=0.3),
+        ]
+        _make_safetensors_dir(Path(missing_dir), {"other": torch.randn(8)})
+        readers = self._make_readers(base_dir, entries2)
+        settings = MergeSettings(consensus=ConsensusMethod.sum)
+        got = merge_tensor(
+            None, entries2, key, readers,
+            MergeSettings(**{**settings.__dict__, "chunk_elements": 64}),
+            base_reader=readers[base_dir],
+        )
+        ref = _run_merge(
+            readers[base_dir].get_tensor(key).clone(), entries2, key, readers,
+            MergeSettings(density=1.0),
+        )
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=1e-2)
+
+    def test_base_none_without_chunk_elements(self, small_model):
+        base_dir, entries, key = small_model
+        readers = self._make_readers(base_dir, entries)
+        # no row budget: the full tensor is loaded instead of crashing
+        got = merge_tensor(None, entries, key, readers, MergeSettings(), base_reader=readers[base_dir])
+        ref = merge_tensor(readers[base_dir].get_tensor(key).clone(), entries, key, readers, MergeSettings())
+        torch.testing.assert_close(got, ref, rtol=2e-2, atol=1e-2)
+        with pytest.raises(ValueError):
+            merge_tensor(None, entries, key, readers, MergeSettings())
 
 
 if __name__ == "__main__":

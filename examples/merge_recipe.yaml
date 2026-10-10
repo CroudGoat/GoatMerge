@@ -19,15 +19,19 @@ tv:
 #     weight: 0.5
 
 # Tuning parameters (all optional; defaults shown)
-consensus: sum
-density: 1.0
-method: null        # null = no sparsification
-n: 64
-m: 256
-gamma: 0.0
-epsilon: 0.0
-rescale: true
-normalize: true
-lambda: 1.0
+merge_method: gta          # gta | linear | mixture | slerp | ties
+consensus: sum             # none | sum | count
+density: 1.0               # 1.0 keeps everything
+method: null               # null | magnitude | random | magnitude_outliers | della_magprune | bs
+n: 64                      # BS block top-n
+m: 256                     # BS block size
+gamma: 0.0                 # magnitude_outliers: fraction dropped from the top
+epsilon: 0.0               # della_magprune: probability spread
+no_rescale: false          # true = skip norm re-normalization after sparsify
+no_normalize: false        # true = skip divisor normalization
+lambda: 1.0                # scale applied to the mixed delta
+
+# Very large tensors: chunk them at this many elements (null = disabled)
 chunk_elements: null
+
 skip_fingerprint_check: false

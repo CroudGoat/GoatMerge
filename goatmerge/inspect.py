@@ -14,7 +14,7 @@ logger = logging.getLogger("goatmerge.inspect")
 
 
 def inspect_dir(path: Path) -> Dict[str, Any]:
-    """Return the metadata envelope + tensor manifest of a TV / merged model."""
+    """Return the GoatMerge sidecar + tensor manifest of a TV / merged model."""
     path = Path(path)
     meta = load_metadata(path)
     validate_metadata(meta)
