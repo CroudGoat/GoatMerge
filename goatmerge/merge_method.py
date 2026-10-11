@@ -49,10 +49,11 @@ class MergeKernel:
         base dtype (S bytes each).
       - ``accumulate(delta, weight)``: add one weighted delta in place.
       - ``finish(entries, readers, key, start=None, end=None) -> torch.Tensor``:
-        return ``base + mixed``. ``entries`` / ``readers`` / ``key`` are passed
-        so a kernel that needs a second streamed pass (the GTA weight-sum
-        divisor) can re-read the deltas; single-pass kernels ignore them.
-        ``start`` / ``end`` bound that re-read to a row range (chunked merge),
+        return ``base + mixed``. ``entries`` / ``readers`` / ``key`` are part
+        of the uniform signature (a kernel needing extra streamed input can
+        re-read the deltas); the shipped kernels need nothing beyond the
+        accumulators — the GTA consensus divisor is built from cached signs.
+        ``start`` / ``end`` bound processing to a row range (chunked merge),
         so no full-tensor delta is ever resident.
 
     No ``torch.stack``: at most one delta is resident at a time.

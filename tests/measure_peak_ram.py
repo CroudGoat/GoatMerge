@@ -1,13 +1,21 @@
 """Measure peak RSS of the streaming merge engine on a synthetic model.
 
-Creates a base model + 2 TV models with a single tensor of known size S,
-runs the full merge (consensus=sum), and reports the merge's peak RSS
-contribution via resource.getrusage high-water-mark deltas.
+Creates a base model + 2 TV models with a single tensor of known size S and
+reports each merge mode's peak RSS contribution. The fixtures are built in a
+child process and every merge runs in its own child, so no allocation of the
+setup can land in the measured process's high-water mark.
 
-Expected: merge peak ≈ 5–7 S (S = largest tensor bytes).
+Usage::
+
+    python tests/measure_peak_ram.py
+
+Expected (S = largest tensor bytes):
+  standard merge   ~5-7 S   (base + acc + l1 + c/nz + one delta + sparsify temp)
+  Chunk Merge      ~2-3 S   (the output buffer + one row chunk per operand)
 """
 
 import json
+import multiprocessing
 import resource
 import shutil
 import tempfile
@@ -15,14 +23,16 @@ from pathlib import Path
 
 import torch
 
-from goatmerge.io import ShardedTensorIndex
-from goatmerge.merge import MergeSettings, ModelEntry, merge_model
 from goatmerge.consensus import ConsensusMethod
+from goatmerge.merge import MergeSettings, ModelEntry, merge_model
+
+S_BYTES = 100 * 1024 * 1024  # 100 MB
+N_ELEMENTS = S_BYTES // 2  # bf16 = 2 bytes/element
 
 
 def _write_safetensors(path: Path, tensors: dict[str, torch.Tensor]) -> None:
-    """Write a single-shard safetensors file."""
     import safetensors
+
     safetensors.torch.save_file(tensors, str(path))
 
 
@@ -35,70 +45,72 @@ def make_model_dir(d: Path, tensors: dict[str, torch.Tensor]) -> None:
     )
 
 
-def main() -> None:
-    # --- choose S (largest tensor bytes) ---
-    # 100 MB bf16 tensor: 100 * 1024 * 1024 / 2 = 52_428_800 elements
-    S_bytes = 100 * 1024 * 1024  # 100 MB
-    n_elements = S_bytes // 2  # bf16 = 2 bytes/element
-    shape = (n_elements,)
+def _build_fixtures(tmp: Path) -> None:
+    """Child-process job: write the on-disk models (memory-heavy, discarded)."""
+    torch.manual_seed(0)
+    base_t = torch.randn(N_ELEMENTS, dtype=torch.bfloat16)
+    tv1_t = (base_t.float() + torch.randn(N_ELEMENTS) * 0.01).to(torch.bfloat16)
+    tv2_t = (base_t.float() + torch.randn(N_ELEMENTS) * 0.01).to(torch.bfloat16)
 
-    # --- create temp dirs ---
-    tmp = Path(tempfile.mkdtemp(prefix="goatmerge_ram_"))
-    base_dir = tmp / "base"
-    tv1_dir = tmp / "tv1"
-    tv2_dir = tmp / "tv2"
-    out_dir = tmp / "out"
+    make_model_dir(tmp / "base", {"weight": base_t})
+    make_model_dir(tmp / "tv1", {"weight": tv1_t})
+    make_model_dir(tmp / "tv2", {"weight": tv2_t})
 
-    # --- create tensors (these are the "on-disk" models) ---
-    base_t = torch.randn(n_elements, dtype=torch.bfloat16)
-    tv1_t = (base_t.float() + torch.randn(n_elements, dtype=torch.float32) * 0.01).to(torch.bfloat16)
-    tv2_t = (base_t.float() + torch.randn(n_elements, dtype=torch.float32) * 0.01).to(torch.bfloat16)
 
-    make_model_dir(base_dir, {"weight": base_t})
-    make_model_dir(tv1_dir, {"weight": tv1_t})
-    make_model_dir(tv2_dir, {"weight": tv2_t})
-
-    # Free the in-memory tensors (they're on disk now)
-    del base_t, tv1_t, tv2_t
-    torch.cuda.empty_cache()  # no-op on CPU, but harmless
-
-    # --- record RSS high-water before merge ---
-    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB
-
-    # --- run merge ---
+def _run_merge(tmp: Path, out_dir: str, chunk_elements, result_file: Path) -> None:
+    """Child-process job: run one merge and report its RSS high-water delta."""
     settings = MergeSettings(
         consensus=ConsensusMethod.sum,
         normalize=True,
         lambda_=1.0,
+        chunk_elements=chunk_elements,
     )
     entries = [
-        ModelEntry(dir=tv1_dir, kind="tv", weight=0.5),
-        ModelEntry(dir=tv2_dir, kind="tv", weight=0.7),
+        ModelEntry(dir=tmp / "tv1", kind="tv", weight=0.5),
+        ModelEntry(dir=tmp / "tv2", kind="tv", weight=0.7),
     ]
-
-    result = merge_model(
-        base_dir=base_dir,
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    merge_model(
+        base_dir=tmp / "base",
         entries=entries,
         settings=settings,
-        out_dir=out_dir,
+        out_dir=tmp / out_dir,
     )
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    result_file.write_text(str(rss_after - rss_before), encoding="utf-8")
 
-    # --- record RSS high-water after merge ---
-    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB
 
-    # --- report ---
-    S_mb = S_bytes / (1024 * 1024)
-    merge_peak_mb = (rss_after - rss_before) / 1024  # KB -> MB
-    ratio = merge_peak_mb / S_mb
+def _measure(tmp: Path, out_dir: str, chunk_elements):
+    ctx = multiprocessing.get_context("fork")
+    result_file = tmp / f"peak_{out_dir}.txt"
+    p = ctx.Process(target=_run_merge, args=(tmp, out_dir, chunk_elements, result_file))
+    p.start()
+    p.join()
+    if p.exitcode != 0:
+        raise RuntimeError(f"merge subprocess failed with code {p.exitcode}")
+    peak_mb = int(result_file.read_text(encoding="utf-8")) / 1024  # KB -> MB
+    return peak_mb / (S_BYTES / (1024 * 1024)), peak_mb
 
-    print(f"S (largest tensor):  {S_mb:.1f} MB")
-    print(f"Merge peak RSS:      {merge_peak_mb:.1f} MB")
-    print(f"Peak / S:            {ratio:.2f}  (target: 5-7)")
-    print(f"Tensors merged:      {result['num_tensors']}")
-    print(f"Skipped:             {len(result['skipped_tensors'])}")
 
-    # Cleanup
-    shutil.rmtree(tmp)
+def main() -> None:
+    s_mb = S_BYTES / (1024 * 1024)
+    tmp = Path(tempfile.mkdtemp(prefix="goatmerge_ram_"))
+    try:
+        ctx = multiprocessing.get_context("fork")
+        builder = ctx.Process(target=_build_fixtures, args=(tmp,))
+        builder.start()
+        builder.join()
+        if builder.exitcode != 0:
+            raise RuntimeError("fixture build failed")
+
+        for label, out_dir, chunk in (
+            ("standard merge", "out_standard", None),
+            ("Chunk Merge (16M elems)", "out_chunk", 16 * 1024 * 1024),
+        ):
+            ratio, peak_mb = _measure(tmp, out_dir, chunk)
+            print(f"{label:24s} peak {peak_mb:8.1f} MB   peak/S {ratio:5.2f}")
+    finally:
+        shutil.rmtree(tmp)
 
 
 if __name__ == "__main__":

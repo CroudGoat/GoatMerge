@@ -22,7 +22,7 @@ from pathlib import Path
 import safetensors.torch
 import torch
 
-from goatmerge.consensus import ConsensusMethod
+from goatmerge.consensus import ConsensusAccumulator, ConsensusMethod
 from goatmerge.extract import extract_task_vector
 from goatmerge.io import ShardReader, ShardedTensorIndex
 from goatmerge.merge import ModelEntry, MergeSettings, merge_tensor
@@ -230,6 +230,45 @@ def test_parity_consensus_count(tmp_path):
         _close(got[k], ref[k])
 
 
+def test_parity_consensus_unnormalized(tmp_path):
+    """Consensus without normalization: no divisor is needed at all."""
+    base_dir, tv1, tv2 = _fixture(tmp_path)
+    for consensus in (ConsensusMethod.sum, ConsensusMethod.count):
+        s = MergeSettings(density=1.0, consensus=consensus, normalize=False)
+        got = _goat_engine(base_dir, [tv1, tv2], [0.5, 0.7], s)
+        ref = _ref_from_dirs(base_dir, [tv1, tv2], [0.5, 0.7], s)
+        for k in got:
+            _close(got[k], ref[k])
+
+
+def test_divisor_from_cached_signs():
+    """Divisor built from cached signs (no re-read) matches hand computation.
+
+    d1 = [[1, -2]] @ 0.5 -> signs [[+1, -1]]; d2 = [[-4, 0.5]] @ 1.0 ->
+    signs [[-1, +1]].
+    sum-majority = sign(acc) = [[-1, -1, +1]] -> divisor [[1.0, 0.5, 0.0]].
+    count-majority = sign(c) = [[+1, +1, +1]] (signs cancel to 0, and
+    0 >= 0) -> divisor [[0.5, 1.0, 0.0]].
+    Zeros never match (the zero-sign element contributes nothing; the
+    ``divisor == 0 -> 1`` fixup lives in the kernel's finish, not here).
+    """
+    base = torch.zeros(1, 3)
+    expected = {
+        ConsensusMethod.sum: torch.tensor([[1.0, 0.5, 0.0]]),
+        ConsensusMethod.count: torch.tensor([[0.5, 1.0, 0.0]]),
+    }
+    for method in (ConsensusMethod.sum, ConsensusMethod.count):
+        acc = ConsensusAccumulator(base, method, store_signs=True)
+        acc.accumulate(torch.tensor([[1.0, -2.0, 0.0]]), 0.5)
+        acc.accumulate(torch.tensor([[-4.0, 0.5, 0.0]]), 1.0)
+        acc.masked_sum_inplace()
+        divisor = torch.zeros_like(base)
+        acc.divisor_from_signs(divisor)
+        assert torch.equal(divisor, expected[method]), (method, divisor)
+        # packets are freed after use
+        assert acc._sign_packets == [] and acc._sign_alphas == []
+
+
 def test_parity_magnitude_sparsify(tmp_path):
     # density 0.25 on 48*64=3072 elems -> k=768 exactly (no round/trunc edge)
     base_dir, tv1, tv2 = _fixture(tmp_path)
@@ -423,3 +462,176 @@ def test_extract_roundtrip(tmp_path):
     meta = load_metadata(tv1)
     validate_metadata(meta)
     assert meta["base_fingerprint"] == compute_base_fingerprint(base_dir)
+
+
+# --------------------------------------------------------------------------- #
+# Chunked extraction (--chunk-elements)
+# --------------------------------------------------------------------------- #
+def _extract_fixture(tmp_path):
+    """A base/source pair with 2-D, 1-D, 3-D and mismatched tensors."""
+    torch.manual_seed(7)
+    base_t = {
+        "w": torch.randn(48, 64, dtype=torch.bfloat16),
+        "b": torch.randn(64, dtype=torch.bfloat16),
+        "cube": torch.randn(6, 5, 7, dtype=torch.bfloat16),
+    }
+    src_t = {
+        "w": (base_t["w"] + torch.randn_like(base_t["w"]) * 0.4),
+        "b": (base_t["b"] + torch.randn_like(base_t["b"]) * 0.4),
+        "cube": (base_t["cube"] + torch.randn_like(base_t["cube"]) * 0.4),
+        # missing in base -> must be skipped, never extracted
+        "extra": torch.randn(4, 4, dtype=torch.bfloat16),
+    }
+    base_dir = str(tmp_path / "base")
+    src_dir = str(tmp_path / "src")
+    _write_model_dir(base_dir, base_t)
+    _write_model_dir(src_dir, src_t)
+    return base_dir, src_dir
+
+
+def test_extract_chunked_matches_standard(tmp_path):
+    """Row-chunked extraction must reproduce the whole-tensor result exactly."""
+    base_dir, src_dir = _extract_fixture(tmp_path)
+
+    tv_plain = str(tmp_path / "tv_plain")
+    tv_chunk = str(tmp_path / "tv_chunk")
+    extract_task_vector(base_dir, src_dir, tv_plain)
+    # 1024-element budget: 48x64 -> 16 rows/chunk, 6x5x7 -> 1 row/chunk,
+    # 1-D "b" (64 elems) stays on the whole-tensor path.
+    extract_task_vector(base_dir, src_dir, tv_chunk, chunk_elements=1024)
+
+    plain = _load_model_tensors(tv_plain)
+    chunked = _load_model_tensors(tv_chunk)
+    assert set(plain) == set(chunked) == {"w", "b", "cube"}
+    for k in plain:
+        assert torch.equal(plain[k], chunked[k]), k
+        # the expected delta itself (bit-exact, same op order)
+        expected = _load_model_tensors(src_dir)[k] - _load_model_tensors(base_dir)[k]
+        assert torch.equal(chunked[k], expected), k
+
+
+def test_extract_chunked_tiny_budget(tmp_path):
+    """A budget smaller than one row still extracts every row exactly once."""
+    base_dir, src_dir = _extract_fixture(tmp_path)
+    tv_chunk = str(tmp_path / "tv_tiny")
+    extract_task_vector(base_dir, src_dir, tv_chunk, chunk_elements=8)
+
+    base_t = _load_model_tensors(base_dir)
+    src_t = _load_model_tensors(src_dir)
+    got = _load_model_tensors(tv_chunk)
+    for k in got:
+        assert torch.equal(got[k], src_t[k] - base_t[k]), k
+
+
+def test_extract_chunked_dtype_mismatch(tmp_path):
+    """An fp32 source against a bf16 base is converted per chunk, exactly."""
+    torch.manual_seed(13)
+    base_t = {"w": torch.randn(32, 16, dtype=torch.bfloat16)}
+    src_t = {"w": (base_t["w"].float() + torch.randn(32, 16) * 0.3)}
+    base_dir = str(tmp_path / "base")
+    src_dir = str(tmp_path / "src")
+    _write_model_dir(base_dir, base_t)
+    _write_model_dir(src_dir, src_t)
+
+    tv_plain = str(tmp_path / "tv_plain")
+    tv_chunk = str(tmp_path / "tv_chunk")
+    extract_task_vector(base_dir, src_dir, tv_plain)
+    extract_task_vector(base_dir, src_dir, tv_chunk, chunk_elements=64)
+
+    plain = _load_model_tensors(tv_plain)["w"]
+    chunked = _load_model_tensors(tv_chunk)["w"]
+    assert plain.dtype == chunked.dtype == torch.bfloat16
+    assert torch.equal(plain, chunked)
+
+
+def test_extract_chunked_shape_mismatch_falls_back(tmp_path):
+    """A superset source (embed-style submatrix) is not chunked, but truncated."""
+    base_dir, src_dir = _extract_fixture(tmp_path)
+    src_t = _load_model_tensors(src_dir)
+    src_t["w"] = torch.randn(64, 64, dtype=torch.bfloat16)  # base "w" is (48, 64)
+    src_big = str(tmp_path / "src_big")
+    _write_model_dir(src_big, src_t)
+
+    tv_chunk = str(tmp_path / "tv_chunk")
+    summary = extract_task_vector(base_dir, src_big, tv_chunk, chunk_elements=1024)
+
+    base_t = _load_model_tensors(base_dir)
+    got = _load_model_tensors(tv_chunk)
+    assert set(got) == {"w", "b", "cube"}
+    # truncated to the base shape, then subtracted
+    assert torch.equal(got["w"], src_t["w"][:48, :] - base_t["w"])
+    assert summary["skipped_tensors"] == []
+
+
+def test_extract_cli_chunk_elements(tmp_path):
+    """``extract --chunk-elements`` reaches the extraction path end to end."""
+    base_dir, src_dir = _extract_fixture(tmp_path)
+    out_dir = str(tmp_path / "tv_cli")
+    other_dir = str(tmp_path / "tv_other")
+    assert cli_main(
+        [
+            "extract",
+            "--base", base_dir,
+            "--source", src_dir,
+            "--out", out_dir,
+            "--chunk-elements", "512",
+        ]
+    ) == 0
+    extract_task_vector(base_dir, src_dir, other_dir)
+
+    a = _load_model_tensors(out_dir)
+    b = _load_model_tensors(other_dir)
+    assert set(a) == set(b)
+    for k in a:
+        assert torch.equal(a[k], b[k]), k
+
+
+def test_extract_cli_drop_caches(tmp_path):
+    """``extract --drop-caches`` extracts bit-identical TVs."""
+    base_dir, src_dir = _extract_fixture(tmp_path)
+    out_plain = str(tmp_path / "tv_plain")
+    out_dc = str(tmp_path / "tv_dc")
+    extract_task_vector(base_dir, src_dir, out_plain)
+    assert cli_main(
+        [
+            "extract",
+            "--base", base_dir,
+            "--source", src_dir,
+            "--out", out_dc,
+            "--chunk-elements", "512",
+            "--drop-caches",
+        ]
+    ) == 0
+
+    a = _load_model_tensors(out_plain)
+    b = _load_model_tensors(out_dc)
+    assert set(a) == set(b)
+    for k in a:
+        assert torch.equal(a[k], b[k]), k
+
+
+def test_merge_cli_drop_caches(tmp_path):
+    """``merge --drop-caches`` merges like the default path and records it."""
+    base_dir, tv1, tv2 = _fixture(tmp_path)
+    out_dir = str(tmp_path / "merged")
+    assert cli_main(
+        [
+            "merge",
+            "--base", base_dir,
+            "--out", out_dir,
+            "--tv", f"{tv1}:0.5",
+            "--tv", f"{tv2}:0.7",
+            "--consensus", "sum",
+            "--drop-caches",
+        ]
+    ) == 0
+
+    meta = load_metadata(out_dir)
+    validate_metadata(meta)
+    assert meta["merge_settings"]["drop_caches"] is True
+
+    s = MergeSettings(density=1.0, consensus=ConsensusMethod.sum)
+    ref = _ref_from_dirs(base_dir, [tv1, tv2], [0.5, 0.7], s)
+    out_tensors = _load_model_tensors(out_dir)
+    for k in ref:
+        _close(out_tensors[k], ref[k])

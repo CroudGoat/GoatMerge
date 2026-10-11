@@ -72,3 +72,10 @@ def test_fingerprint_differs_across_models(tmp_path):
     _write_single_file(d1, {"w": torch.randn(32, 32)})
     _write_single_file(d2, {"w": torch.randn(32, 32)})  # different values
     assert compute_base_fingerprint(d1) != compute_base_fingerprint(d2)
+
+
+def test_fingerprint_drop_caches_matches(tmp_path):
+    """drop_caches only releases page cache; the digest must be identical."""
+    d = str(tmp_path)
+    _write_single_file(d, {"w": torch.randn(16, 16, dtype=torch.bfloat16), "b": torch.randn(16)})
+    assert compute_base_fingerprint(d, drop_caches=True) == compute_base_fingerprint(d)

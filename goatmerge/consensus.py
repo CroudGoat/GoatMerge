@@ -24,20 +24,20 @@ mask which drops sign-0 elements):
     mixed = (acc + M * l1) / 2,   M = +1 if acc >= 0 else -1   [sum]
     mixed = (acc + M * l1) / 2,   M = +1 if c   >= 0 else -1   [count]
 
-so the masked sum needs no second pass over the deltas; only ``divisor``
-(per-element weight sum over sign-matching TVs) requires a second pass.
+so the masked sum needs no second pass over the deltas. The divisor
+(per-element weight sum over sign-matching TVs) is built from 2-bit-packed
+signs cached during accumulation — again with no re-read — so each tensor
+is read from disk exactly once per merge.
 """
 
 from __future__ import annotations
 
 from enum import Enum
-from typing import Optional
+from typing import List, Optional
 
 import torch
 
-from .io import load_delta, load_delta_chunk
 from .merge_method import MergeKernel
-from .sparsify import merge_generator, sparsify_delta
 
 
 class ConsensusMethod(str, Enum):
@@ -46,15 +46,52 @@ class ConsensusMethod(str, Enum):
     count = "count"
 
 
+def _pack_signs(delta: torch.Tensor) -> torch.Tensor:
+    """Pack ``delta.sign()`` into 2 bits per element (uint8, LSB-first).
+
+    Encoding 0b00 = zero, 0b01 = +1, 0b10 = -1: a zero entry never equals a
+    majority sign (+1/-1), mirroring the reference mask which drops sign-0
+    elements. The trailing byte is zero-padded (also never matching).
+    Comparison-based (no ``sign()`` temporary) and shape-agnostic.
+    """
+    d = delta.reshape(-1)
+    lo = (d > 0).to(torch.uint8)
+    lo |= ((d < 0).to(torch.uint8) << 1)
+    pad = (-lo.numel()) % 4
+    if pad:
+        lo = torch.cat([lo, torch.zeros(pad, dtype=torch.uint8)])
+    code = lo.reshape(-1, 4)
+    return (code[:, 0] | (code[:, 1] << 2) | (code[:, 2] << 4) | (code[:, 3] << 6)).contiguous()
+
+
+def _unpack_match(packed: torch.Tensor, shape, majority: torch.Tensor) -> torch.Tensor:
+    """uint8 mask: 1 where the cached 2-bit sign equals ``majority`` (+1/-1).
+
+    Inverse of :func:`_pack_signs`. Zero-sign entries (0b00, including
+    padding) never match, exactly like the reference mask.
+    """
+    n = 1
+    for s in shape:
+        n *= s
+    b = packed.reshape(-1, 1)
+    shifts = torch.tensor([0, 2, 4, 6], dtype=torch.uint8, device=packed.device)
+    codes = ((b >> shifts) & 3).reshape(-1)[:n].reshape(shape)
+    plus = majority > 0
+    return torch.where(plus, codes == 0b01, codes == 0b10).to(torch.uint8)
+
+
 class ConsensusAccumulator:
     """Streams deltas into per-element sign-consensus accumulators.
 
     All accumulators live in the base dtype (``c`` is int8), so the
     bookkeeping costs S bytes each instead of k*S. ``l1`` is only allocated
-    when a consensus mask is actually needed (``method != none``).
+    when a consensus mask is actually needed (``method != none``). With
+    ``store_signs``, each contributing delta's sign is additionally cached
+    2-bit-packed (k*S/4 transient bytes), so the consensus divisor can be
+    built without re-reading the deltas.
     """
 
-    def __init__(self, base: torch.Tensor, method: ConsensusMethod) -> None:
+    def __init__(self, base: torch.Tensor, method: ConsensusMethod, store_signs: bool = False) -> None:
         self.method = method
         self.acc = torch.zeros_like(base)          # sum_i alpha_i * delta_i
         self.l1: Optional[torch.Tensor] = None     # sum_i |alpha_i * delta_i|
@@ -70,6 +107,13 @@ class ConsensusAccumulator:
             # count k instead would over-count when (sparse) deltas contain
             # exact zeros, since those carry sign 0.
             self.nz = torch.zeros_like(base, dtype=torch.int8)
+        # 2-bit-packed sign(alpha_i * delta_i) per contributing delta, with
+        # its weight: the divisor is built from these (see divisor_from_signs)
+        # instead of a second streamed pass. Only needed when a divisor will
+        # actually be computed (consensus + normalize).
+        self._store_signs = store_signs and method != ConsensusMethod.none
+        self._sign_packets: List[torch.Tensor] = []
+        self._sign_alphas: List[float] = []
         # Number of (present) deltas accumulated and the sum of their
         # weights. Mirrors mergekit, whose divisor / normalized weight sum
         # only covers the task vectors that actually contributed this tensor.
@@ -99,6 +143,12 @@ class ConsensusAccumulator:
             s = delta.sign().to(torch.int8)
             self.nz.add_(s.abs())
             self.c.add_(s)
+        if self._store_signs:
+            # Cache the weighted, sparsified signs for the divisor: delta is
+            # final here (weighted above, sparsified by the caller before
+            # accumulate), so no re-read and no re-sparsify is ever needed.
+            self._sign_packets.append(_pack_signs(delta))
+            self._sign_alphas.append(alpha)
 
     def majority(self) -> torch.Tensor:
         """Per-element majority sign as an int8 tensor of +1/-1.
@@ -122,35 +172,41 @@ class ConsensusAccumulator:
         self.acc.mul_(0.5)       # acc = mixed
         return self.acc
 
-    def mask_for(self, delta: torch.Tensor, alpha: float) -> torch.Tensor:
-        """uint8 mask: 1 where sign(alpha*delta) == majority, else 0.
+    def divisor_from_signs(self, divisor: torch.Tensor) -> None:
+        """divisor += alpha_i * [sign_i == majority], from cached signs.
 
-        Requires ``masked_sum_inplace`` to have run (it stores the
-        majority sign in ``self._majority``).
+        Requires ``masked_sum_inplace`` to have run (it stores the majority
+        sign in ``self._majority``). Cached packets are freed. Zero-sign
+        entries never match, mirroring the reference mask.
         """
-        s = delta.sign().to(torch.int8)
-        if alpha < 0:
-            s.neg_()
-        return (s == self._majority).to(torch.uint8)
-
-    def divisor_accumulate(self, divisor: torch.Tensor, delta: torch.Tensor, alpha: float) -> None:
-        """divisor += alpha * mask (in place)."""
-        divisor.add_(self.mask_for(delta, alpha), alpha=alpha)
+        majority = self._majority
+        shape = tuple(majority.shape)
+        for packet, alpha in zip(self._sign_packets, self._sign_alphas):
+            match = _unpack_match(packet, shape, majority)
+            divisor.add_(match, alpha=alpha)
+            del match
+        self._sign_packets.clear()
+        self._sign_alphas.clear()
 
 
 class GtaKernel(MergeKernel):
     """Generalized Task Arithmetic kernel (the reference method).
 
-    Streams each weighted delta once per pass. The no-consensus path is a single
-    pass; the consensus path needs a second streamed pass for the per-element
-    weight-sum divisor (re-reads the deltas via ``readers`` — only the row
-    range ``[start, end)`` when merging in chunked mode, so peak RAM stays
-    O(chunk) instead of one full delta).
+    Streams each weighted delta exactly once. The no-consensus path is a
+    single pass; the consensus path builds the per-element weight-sum
+    divisor from cached signs (no second streamed pass, no re-reads).
     """
 
     def __init__(self, base: torch.Tensor, settings) -> None:
         super().__init__(base, settings)
-        self._acc = ConsensusAccumulator(base, settings.consensus)
+        s = settings
+        self._acc = ConsensusAccumulator(
+            base, s.consensus,
+            # Signs are only needed for the divisor, which is only computed
+            # under consensus + normalize. Otherwise each delta is touched
+            # once and forgotten.
+            store_signs=(s.consensus != ConsensusMethod.none and s.normalize),
+        )
 
     def accumulate(self, delta: torch.Tensor, weight: float) -> None:
         self._acc.accumulate(delta, weight)
@@ -175,30 +231,12 @@ class GtaKernel(MergeKernel):
         mixed = acc.masked_sum_inplace()
         del acc.l1
         acc.l1 = None
-        divisor = torch.zeros_like(base)
-        if masker is not None:
-            masker.begin_pass(chunk)
-        for i, entry in enumerate(entries):
-            if start is not None:
-                delta = load_delta_chunk(base, entry.dir, entry.kind, key, readers, start, end)
-            else:
-                delta = load_delta(base, entry.dir, entry.kind, key, readers)
-            if delta is None:
-                continue
-            if masker is None or not masker.apply(i, delta):
-                # same mask as the accumulation pass: same per-chunk
-                # generator seed, or the same global mask parameters
-                sparsify_delta(
-                    delta, s.method,
-                    density=s.density, n=s.n, m=s.m, gamma=s.gamma,
-                    epsilon=s.epsilon, rescale=s.rescale,
-                    chunk_elements=s.chunk_elements,
-                    generator=merge_generator(key, i, chunk),
-                )
-            acc.divisor_accumulate(divisor, delta, entry.weight)
-            del delta
-        divisor[divisor == 0] = 1
         if s.normalize:
+            # The divisor comes from the signs cached during accumulation —
+            # no second streamed pass over the deltas.
+            divisor = torch.zeros_like(base)
+            acc.divisor_from_signs(divisor)
+            divisor[divisor == 0] = 1
             mixed.div_(divisor)
         if s.lambda_ != 1.0:
             mixed.mul_(s.lambda_)

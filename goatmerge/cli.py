@@ -70,6 +70,7 @@ def _build_settings(args, yaml_dict: dict) -> MergeSettings:
     lambda_ = _resolve_param(args.lambda_, yaml_dict, "lambda", 1.0)
     consensus = _resolve_param(args.consensus, yaml_dict, "consensus", "none")
     chunk_elements = _resolve_param(args.chunk_elements, yaml_dict, "chunk_elements", None)
+    drop_caches = _resolve_param(args.drop_caches, yaml_dict, "drop_caches", False)
 
     method = None
     if method_str is not None:
@@ -88,13 +89,20 @@ def _build_settings(args, yaml_dict: dict) -> MergeSettings:
         lambda_=lambda_,
         consensus=ConsensusMethod(consensus),
         chunk_elements=chunk_elements,
+        drop_caches=drop_caches,
     )
 
 
 def cmd_extract(args) -> int:
     base = resolve_model_dir(args.base)
     source = resolve_model_dir(args.source)
-    summary = extract_task_vector(base, source, Path(args.out))
+    summary = extract_task_vector(
+        base,
+        source,
+        Path(args.out),
+        chunk_elements=args.chunk_elements,
+        drop_caches=args.drop_caches,
+    )
     print(json.dumps(summary, indent=2))
     return 0
 
@@ -163,7 +171,7 @@ def cmd_merge(args) -> int:
     if tv_dirs and not skip_fp:
         from .fingerprint import compute_base_fingerprint
 
-        mismatches = verify_against_base(base, tv_dirs)
+        mismatches = verify_against_base(base, tv_dirs, drop_caches=settings.drop_caches)
         if mismatches:
             print(
                 "error: base fingerprint mismatch for: " + ", ".join(mismatches),
@@ -192,6 +200,7 @@ def cmd_merge(args) -> int:
             "lambda": settings.lambda_,
             "consensus": settings.consensus.value,
             "chunk_elements": settings.chunk_elements,
+            "drop_caches": settings.drop_caches,
         },
     )
     write_metadata(Path(out_str), meta)
@@ -217,6 +226,20 @@ def main(argv=None) -> int:
     pe.add_argument("--base", required=True, help="base model dir or HF repo id")
     pe.add_argument("--source", required=True, help="source (fine-tuned) model dir or HF repo id")
     pe.add_argument("--out", required=True, help="output task-vector directory")
+    pe.add_argument(
+        "--chunk-elements",
+        type=int,
+        default=None,
+        help="extract tensors above this many elements row by row "
+             "(O(S) + O(chunk) peak RAM instead of 2 S per tensor)",
+    )
+    pe.add_argument(
+        "--drop-caches",
+        action="store_true",
+        help="release each file range from the page cache right after reading "
+             "(POSIX_FADV_DONTNEED): bulk extraction does not fill system memory "
+             "with file cache",
+    )
     pe.set_defaults(func=cmd_extract)
 
     pm = sub.add_parser("merge", help="merge base + weighted task vectors / models")
@@ -253,6 +276,15 @@ def main(argv=None) -> int:
              "(O(S) + O(chunk) peak RAM instead of O(S) per accumulator)",
     )
     pm.add_argument("--skip-fingerprint-check", action="store_true", default=None)
+    pm.add_argument(
+        "--drop-caches",
+        action="store_true",
+        default=None,
+        help="release each file range from the page cache right after reading "
+             "(POSIX_FADV_DONTNEED): bulk merging does not fill system memory "
+             "with file cache. Opt-in because a consensus divisor second pass "
+             "re-reads the same deltas, which then comes back from disk.",
+    )
     pm.set_defaults(func=cmd_merge)
 
     pi = sub.add_parser("inspect", help="show metadata/manifest of a TV or merged model")

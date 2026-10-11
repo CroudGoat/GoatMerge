@@ -27,13 +27,15 @@ def inspect_dir(path: Path) -> Dict[str, Any]:
     }
 
 
-def verify_against_base(base_dir: Path, tv_dirs: List[Path]) -> List[str]:
+def verify_against_base(
+    base_dir: Path, tv_dirs: List[Path], drop_caches: bool = False
+) -> List[str]:
     """Check each TV's stored base fingerprint against ``base_dir``.
 
     Returns the list of TV dirs whose fingerprint does not match (empty
     list = all consistent).
     """
-    base_fp = compute_base_fingerprint(Path(base_dir))
+    base_fp = compute_base_fingerprint(Path(base_dir), drop_caches=drop_caches)
     mismatches: List[str] = []
     for tv in tv_dirs:
         meta = load_metadata(Path(tv))

@@ -3,12 +3,14 @@ import torch
 from goatmerge.sparsify import (
     RescaleNorm,
     SparsificationMethod,
+    bernoulli_mask,
     bs_mask,
     bs_mask_chunked,
     magnitude_mask,
     magnitude_mask_chunked,
     magnitude_outliers_mask,
     magnitude_outliers_mask_chunked,
+    merge_generator,
     sparsify_inplace,
 )
 
@@ -150,3 +152,57 @@ def test_k_uses_truncation_like_mergekit():
     torch.manual_seed(13)
     t = torch.randn(55)
     assert int(magnitude_mask(t, 0.1).sum()) == int(0.1 * 55)
+
+
+def test_bernoulli_mask_deterministic():
+    """Same seed -> same mask; density roughly honored (distribution check)."""
+    torch.manual_seed(21)
+    t = torch.randn(20_000, dtype=torch.bfloat16)
+    m1 = bernoulli_mask(t, 0.3, generator=merge_generator("k", 0))
+    m2 = bernoulli_mask(t, 0.3, generator=merge_generator("k", 0))
+    assert torch.equal(m1, m2)
+    assert m1.dtype == torch.uint8
+    kept = float(m1.sum()) / m1.numel()
+    assert abs(kept - 0.3) < 0.02, kept
+    m3 = bernoulli_mask(t, 0.3, generator=merge_generator("k", 1))
+    assert not torch.equal(m1, m3)  # different seed -> different mask
+
+
+def test_sparsify_default_budget_matches_explicit_chunking():
+    """The internal default budget reproduces explicit chunk_elements results.
+
+    Deterministic methods must match bit-exactly; stochastic methods must
+    match when the same chunking is applied with the same generator state
+    (torch's CPU RNG stream is shape-dependent, so whole-tensor application
+    is *not* bit-identical to chunked application — only determinism and
+    cross-pass consistency are guaranteed).
+    """
+    from goatmerge.sparsify import _DEFAULT_SPARSE_CHUNK_ELEMENTS
+
+    torch.manual_seed(22)
+    n = _DEFAULT_SPARSE_CHUNK_ELEMENTS + 123
+    t = torch.randn(n, dtype=torch.bfloat16)
+    # deterministic methods: default budget == explicit small-chunk budget
+    for method, kw in (
+        (SparsificationMethod.magnitude, {}),
+        (SparsificationMethod.magnitude_outliers, {"gamma": 0.1}),
+        (SparsificationMethod.bs, {"n": 8, "m": 32}),
+    ):
+        a = sparsify_inplace(t.clone(), 0.5, method, **kw)
+        b = sparsify_inplace(t.clone(), 0.5, method, chunk_elements=997, **kw)
+        assert torch.equal(a, b), method
+    # stochastic methods: same-chunking reproducibility (pass-1 vs pass-2)
+    for method, kw in (
+        (SparsificationMethod.random, {}),
+        (SparsificationMethod.della_magprune, {"epsilon": 0.1}),
+    ):
+        t2d = torch.randn(64, n // 64, dtype=torch.bfloat16)
+        p1 = sparsify_inplace(
+            t2d.clone(), 0.5, method,
+            generator=merge_generator("k", 0), **kw,
+        )
+        p2 = sparsify_inplace(
+            t2d.clone(), 0.5, method,
+            generator=merge_generator("k", 0), **kw,
+        )
+        assert torch.equal(p1, p2), method

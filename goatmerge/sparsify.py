@@ -51,16 +51,19 @@ EPS = 1e-7
 # Bounded so the scan never materializes more than a chunk of |values| at once.
 _SCAN_CHUNK_ELEMENTS = 10_000_000
 
+# Default budget for sparsify_inplace's chunked mask builders, applied when
+# the caller passes no explicit chunk_elements. Bounds the mask temporaries
+# (notably della's int64 argsort workspace) to O(budget) with no change to
+# deterministic masks and deterministic stochastic masks from the same seed.
+_DEFAULT_SPARSE_CHUNK_ELEMENTS = 8_000_000
+
 
 def merge_generator(key: str, index: int, chunk: int = 0) -> torch.Generator:
     """Deterministic CPU generator for a (tensor, source, chunk) triple.
 
     Seeded from ``(key, index, chunk)`` so that a stochastic mask
     (``random`` / ``della_magprune``) is *identical* for the same source and
-    chunk in every pass of a merge. The consensus divisor is computed in a
-    second streamed pass that re-reads and re-sparsifies each delta; without a
-    shared seed the two masks differ and the divisor no longer matches the
-    masked numerator.
+    chunk in every run of a merge.
     """
     g = torch.Generator(device="cpu")
     seed = (zlib.crc32(key.encode("utf-8")) * 1_000_003 + index * 7919 + chunk) % (2**63 - 1)
@@ -139,17 +142,20 @@ def bernoulli_mask(
     density: float,
     generator: Optional[torch.Generator] = None,
 ) -> torch.Tensor:
-    """0/1 mask: each element kept with probability ``density``."""
+    """0/1 mask: each element kept with probability ``density``.
+
+    Drawn in place into a single float buffer (no ``full_like`` probability
+    tensor): the RNG stream is consumed in the same element order as
+    ``torch.bernoulli(full_like(...))``, so the mask is identical.
+    """
     work_dtype = (
         t.dtype
         if t.device.type != "cpu" or t.dtype == torch.bfloat16
         else torch.float32
     )
-    mask = torch.bernoulli(
-        torch.full_like(input=t, fill_value=density, dtype=work_dtype),
-        generator=generator,
-    )
-    return (mask > 0).to(torch.uint8).reshape_as(t)
+    probs = torch.empty(t.shape, dtype=work_dtype, device=t.device)
+    probs.bernoulli_(density, generator=generator)
+    return (probs > 0).to(torch.uint8).reshape_as(t)
 
 
 def della_mask(
@@ -241,7 +247,10 @@ def sparsify_inplace(
     Returns the (modified) ``t``. If ``density >= 1`` the tensor is unchanged.
 
     ``chunk_elements`` bounds the global magnitude/BS mask to a chunked
-    two-pass computation, keeping per-chunk RAM O(chunk).
+    two-pass computation, keeping per-chunk RAM O(chunk). When ``None``, an
+    internal budget (``_DEFAULT_SPARSE_CHUNK_ELEMENTS``) still applies, so a
+    large tensor never materializes full-size mask temporaries (notably the
+    int64 double-``argsort`` of ``della_magprune``).
 
     ``generator`` seeds the stochastic masks (``random`` / ``della_magprune``)
     so the same mask is produced for the same (tensor, source) pair in every
@@ -251,18 +260,25 @@ def sparsify_inplace(
         return t
 
     n_elems = t.numel()
-    chunked = chunk_elements is not None and n_elems > max(1, chunk_elements)
+    # An internal budget always applies: the chunked mask builders reproduce
+    # the whole-tensor mask (magnitude/bs/outliers bit-exactly; bernoulli and
+    # della deterministically from the same generator state), so bounding the
+    # temporaries changes peak RAM, not results. Without this, a large tensor
+    # in the standard (non-Chunk-Merge) path would materialize full-size
+    # temporaries — e.g. della's int64 double-argsort at ~16 bytes/element.
+    budget = chunk_elements if chunk_elements is not None else _DEFAULT_SPARSE_CHUNK_ELEMENTS
+    chunked = n_elems > max(1, budget)
     if chunked:
         if method == SparsificationMethod.magnitude:
-            mask = magnitude_mask_chunked(t, density, chunk_elements)
+            mask = magnitude_mask_chunked(t, density, budget)
         elif method == SparsificationMethod.bs:
-            mask = bs_mask_chunked(t, n, m, chunk_elements)
+            mask = bs_mask_chunked(t, n, m, budget)
         elif method == SparsificationMethod.magnitude_outliers:
-            mask = magnitude_outliers_mask_chunked(t, density, gamma, chunk_elements)
+            mask = magnitude_outliers_mask_chunked(t, density, gamma, budget)
         elif method == SparsificationMethod.random:
-            mask = bernoulli_mask_chunked(t, density, chunk_elements, generator=generator)
+            mask = bernoulli_mask_chunked(t, density, budget, generator=generator)
         elif method == SparsificationMethod.della_magprune:
-            mask = della_mask_chunked(t, density, epsilon, chunk_elements, generator=generator)
+            mask = della_mask_chunked(t, density, epsilon, budget, generator=generator)
         else:
             mask = make_mask(t, density, method, n=n, m=m, gamma=gamma, epsilon=epsilon, generator=generator)
     else:

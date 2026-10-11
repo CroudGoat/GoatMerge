@@ -34,4 +34,10 @@ lambda: 1.0                # scale applied to the mixed delta
 # Very large tensors: chunk them at this many elements (null = disabled)
 chunk_elements: null
 
+# Page-cache hygiene: release each file range right after reading it
+# (POSIX_FADV_DONTNEED), so bulk merging does not fill system memory with
+# file cache. Opt-in: a consensus divisor second pass re-reads the same
+# deltas, which then comes back from disk instead of cache.
+drop_caches: false
+
 skip_fingerprint_check: false

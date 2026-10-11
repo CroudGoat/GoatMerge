@@ -117,18 +117,114 @@ class ShardedTensorIndex:
         return sorted(self.tensor_paths.keys())
 
 
+def advise_drop_caches(fd: int, offset: int, length: int) -> None:
+    """Advise the kernel that a just-read file range will not be re-read.
+
+    Uses ``POSIX_FADV_DONTNEED`` so the pages backing the range are released
+    from the page cache instead of lingering until memory pressure. This keeps
+    a streaming, single-pass workload (extract, consensus-free merge) from
+    filling system memory with file cache. No-op on platforms without
+    ``os.posix_fadvise``. Callers must only use it for data they will not
+    re-read soon: a consensus divisor second pass, for example, re-reads the
+    same deltas and would go back to disk.
+    """
+    if length <= 0:
+        return
+    fadvise = getattr(os, "posix_fadvise", None)
+    dontneed = getattr(os, "POSIX_FADV_DONTNEED", None)
+    if fadvise is None or dontneed is None:
+        return
+    try:
+        fadvise(fd, offset, length, dontneed)
+    except OSError:
+        pass
+
+
+# Canonical safetensors dtype table: string name -> (torch dtype, bytes/element).
+# Single source of truth for dtype mapping in both directions.
+_SAFETENSORS_DTYPES = {
+    "BF16": (torch.bfloat16, 2),
+    "F16": (torch.float16, 2),
+    "F32": (torch.float32, 4),
+    "F64": (torch.float64, 8),
+    "I8": (torch.int8, 1),
+    "U8": (torch.uint8, 1),
+    "I16": (torch.int16, 2),
+    "I32": (torch.int32, 4),
+    "I64": (torch.int64, 8),
+    "BOOL": (torch.bool, 1),
+}
+_TORCH_TO_SAFETENSORS = {v[0]: k for k, v in _SAFETENSORS_DTYPES.items()}
+
+
+def dtype_from_safetensors(dtype_str: str) -> torch.dtype:
+    """Map a safetensors dtype string (``"BF16"``, ``"F32"``, ...) to a torch dtype.
+
+    Single source of truth shared by the row reader and the chunked paths.
+    Unknown strings fall back to bfloat16, the dtype these engines are tuned
+    for; every dtype safetensors can store is mapped explicitly.
+    """
+    entry = _SAFETENSORS_DTYPES.get(dtype_str)
+    return entry[0] if entry is not None else torch.bfloat16
+
+
+def safetensors_dtype_str(dtype: torch.dtype) -> str:
+    """Map a torch dtype to its safetensors string name (inverse of above)."""
+    try:
+        return _TORCH_TO_SAFETENSORS[dtype]
+    except KeyError:
+        raise ValueError(f"dtype {dtype} has no safetensors representation")
+
+
+def safetensors_elem_size(dtype_str: str) -> int:
+    """Bytes per element for a safetensors dtype string (no tensor needed)."""
+    entry = _SAFETENSORS_DTYPES.get(dtype_str)
+    if entry is None:
+        raise ValueError(f"unknown safetensors dtype: {dtype_str!r}")
+    return entry[1]
+
+
+def shape_fit(base_shape, src_shape) -> Optional[str]:
+    """How a source tensor fits a base tensor: ``"exact"``, ``"submatrix"``.
+
+    ``"submatrix"`` is the embed-style truncation (source is a superset grid
+    in dims 0-1 with identical trailing dims). Returns ``None`` when the
+    tensor must be skipped. Shared by the delta shape checks and the writer
+    arrival planner so the two can never disagree.
+    """
+    base_shape = tuple(base_shape)
+    src_shape = tuple(src_shape)
+    if base_shape == src_shape:
+        return "exact"
+    if (
+        len(base_shape) >= 2
+        and len(src_shape) >= 2
+        and src_shape[0] >= base_shape[0]
+        and src_shape[1] >= base_shape[1]
+        and src_shape[2:] == base_shape[2:]
+    ):
+        return "submatrix"
+    return None
+
+
 class ShardReader:
     """Lazy streaming reader over a :class:`ShardedTensorIndex`.
 
     A shard is opened once and reused until its keys are exhausted, then
     closed. The only tensors resident at any moment are those returned by
     ``get_tensor`` (one per call).
+
+    ``drop_caches`` asks the kernel to release each file range right after
+    it is read (see :func:`advise_drop_caches`), so bulk one-shot reads do
+    not fill the page cache. Only enable it for data that will not be
+    re-read soon.
     """
 
-    def __init__(self, index: ShardedTensorIndex, use_mmap: bool = False):
+    def __init__(self, index: ShardedTensorIndex, use_mmap: bool = False, drop_caches: bool = False):
         self.index = index
         self._handles: Dict[str, "safetensors.torch.safe_open"] = {}
         self._use_mmap = use_mmap
+        self._drop_caches = drop_caches
         # shard filename -> (parsed safetensors header, header byte length)
         self._header_cache: Dict[str, Tuple[dict, int]] = {}
 
@@ -174,15 +270,7 @@ class ShardReader:
             # data_offsets are relative to the data-section start (8 + header_len),
             # not absolute file positions. Add the base to get the absolute offset.
             base = 8 + header_len
-            dtype_map = {
-                "BF16": torch.bfloat16,
-                "F16": torch.float16,
-                "F32": torch.float32,
-                "F64": torch.float64,
-                "I32": torch.int32,
-                "I64": torch.int64,
-            }
-            dtype = dtype_map.get(dtype_str, torch.bfloat16)
+            dtype = dtype_from_safetensors(dtype_str)
             # Compute the byte offset for the row range.
             # For a (R, C1, C2, ..., Ck) tensor, row i starts at byte
             # i * (C1*C2*...*Ck) * element_size within the tensor data.
@@ -195,14 +283,31 @@ class ShardReader:
             if row_end is None:
                 row_end = n_rows
             row_end_byte = base + data_start + row_end * cols * elem_size
-            f.seek(row_start_byte)
-            raw = f.read(row_end_byte - row_start_byte)
-            # Use a writable bytearray to avoid the non-writable buffer warning.
-            buf = bytearray(raw)
-            t = torch.frombuffer(buf, dtype=dtype).reshape(
-                (row_end - row_start,) + shape[1:]
-            )
-            return t.clone()
+            n_elems = row_end - row_start
+            shape_out = (n_elems,) + shape[1:]
+            n_bytes = row_end_byte - row_start_byte
+            if n_bytes == 0:
+                return torch.empty(shape_out, dtype=dtype)
+            # One allocation per read: the bytes land directly in the
+            # bytearray that backs the returned tensor, so a read costs a single
+            # buffer (instead of bytes -> bytearray -> clone) and still returns
+            # storage the caller exclusively owns.
+            buf = bytearray(n_bytes)
+            mv = memoryview(buf)
+            with open(str(path), "rb") as f:
+                f.seek(row_start_byte)
+                read = 0
+                while read < n_bytes:
+                    got = f.readinto(mv[read:])
+                    if got == 0:
+                        raise RuntimeError(
+                            f"short read for {key} in {path} "
+                            f"(wanted {n_bytes} bytes, got {read})"
+                        )
+                    read += got
+                if self._drop_caches:
+                    advise_drop_caches(f.fileno(), row_start_byte, n_bytes)
+            return torch.frombuffer(buf, dtype=dtype).reshape(shape_out)
 
     def get_slice(self, key: str):
         """Return a reusable slice object for ``key`` (opened on first use)."""
@@ -297,48 +402,55 @@ def _prepare_delta(
     entry_dir,
     kind: str,
     key: str,
+    clone: bool = True,
 ) -> Optional[torch.Tensor]:
     """Shape-check ``t`` against ``base`` and convert it to a delta.
 
     ``entry_dir`` / ``key`` are only used for the log messages. Returns
     ``None`` when the tensor is size-incompatible (caller skips it).
+
+    ``clone=False`` skips the defensive copy before the in-place subtraction.
+    Only safe when the reader already owns ``t``'s storage: the direct-read
+    path clones on every read, while an mmap-backed ``get_tensor`` returns a
+    view into the mapped shard, which must never be mutated in place.
     """
     if t.shape != base.shape:
         # embed-style submatrix: truncate when the TV is a superset grid
-        if (
-            base.dim() >= 2
-            and t.dim() >= 2
-            and t.shape[0] >= base.shape[0]
-            and t.shape[1] >= base.shape[1]
-            and t.shape[2:] == base.shape[2:]
-        ):
+        fit = shape_fit(tuple(base.shape), tuple(t.shape))
+        if fit == "submatrix":
             logger.warning("using submatrix of %s:%s", entry_dir, key)
             t = t[: base.shape[0], : base.shape[1], *base.shape[2:]]
         else:
             logger.warning("skipping %s:%s due to size mismatch", entry_dir, key)
             return None
     if kind == "tv":
-        return t.to(base.dtype).clone()
-    # model mode: delta = W_i - base (in place after clone)
-    t = t.to(base.dtype).clone()
+        # ``t.to`` is a no-op (same object) when the dtype already matches.
+        t = t.to(base.dtype)
+        return t if not clone else t.clone()
+    # model mode: delta = W_i - base. ``t.to`` is a no-op (same object) when
+    # the dtype already matches, so the subtraction stays in place.
+    t = t.to(base.dtype)
+    if clone:
+        t = t.clone()
     t.sub_(base)
     return t
 
 
-def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict):
+def load_delta(base: torch.Tensor, entry_dir, kind: str, key: str, readers: dict, clone: bool = True):
     """Load ``delta = W_i - base`` (``kind="model"``) or the stored TV (``kind="tv"``).
 
     Returns ``None`` if the tensor is missing or size-incompatible. The
     returned tensor owns its storage (cloned). ``entry_dir`` is a ``Path`` and
     ``kind`` is ``"tv"`` or ``"model"`` (no ``ModelEntry`` import, so this stays
-    import-cycle-free).
+    import-cycle-free). ``clone=False`` saves one full-tensor copy for callers
+    whose reader already returns owned storage (see :func:`_prepare_delta`).
     """
     reader = readers[entry_dir]
     if key not in reader.index.tensor_paths:
         logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
         return None
     t = reader.get_tensor(key)
-    return _prepare_delta(t, base, entry_dir, kind, key)
+    return _prepare_delta(t, base, entry_dir, kind, key, clone=clone)
 
 
 def load_delta_chunk(
@@ -349,20 +461,23 @@ def load_delta_chunk(
     readers: dict,
     start: int,
     end: int,
+    clone: bool = True,
 ) -> Optional[torch.Tensor]:
     """Load rows ``[start:end]`` of the tensor as a delta chunk.
 
     Row ranges are read straight from the shard (no full-tensor load) and go
     through the same shape checks as :func:`load_delta`, so a missing or
     size-incompatible tensor is skipped rather than corrupting the merge.
-    Returns ``None`` when the tensor must be skipped.
+    Returns ``None`` when the tensor must be skipped. ``clone=False`` saves
+    one row-chunk copy for callers whose reader already returns owned storage
+    (see :func:`_prepare_delta`).
     """
     reader = readers[entry_dir]
     if key not in reader.index.tensor_paths:
         logger.warning("skipping %s:%s (tensor missing)", entry_dir, key)
         return None
     t = reader.get_slice(key)[start:end]
-    return _prepare_delta(t, base_chunk, entry_dir, kind, key)
+    return _prepare_delta(t, base_chunk, entry_dir, kind, key, clone=clone)
 
 
 # --------------------------------------------------------------------------- #
@@ -405,32 +520,115 @@ def copy_support_files(base_dir, out_dir) -> List[str]:
     return copied
 
 
+# Bounded transient per tensor write: tensor bytes are appended to the shard
+# file in slices of at most this many bytes (one memcpy, freed at once).
+_WRITE_SLICE_BYTES = 64 * 1024 * 1024
+
+
+def _safetensors_header_bytes(entries) -> bytes:
+    """Serialize one shard's header in canonical form.
+
+    ``entries``: ``(name, dtype_str, shape, start, nbytes)``. Keys sorted by
+    name, compact JSON separators, space-padded to an 8-byte multiple — the
+    same framing ``safetensors.torch.save_file`` uses. (``save_file`` itself
+    emits header entries in an opaque, implementation-defined order, so
+    byte-equality with it is not a goal; values, offsets, layout, and
+    determinism are. Canonical sorted order is strictly more reproducible.)
+    """
+    header = {"__metadata__": {"format": "pt"}}
+    for name, dtype_str, shape, start, nbytes in sorted(entries, key=lambda e: e[0]):
+        header[name] = {
+            "dtype": dtype_str,
+            "shape": list(shape),
+            "data_offsets": [start, start + nbytes],
+        }
+    raw = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    return raw + b" " * (-len(raw) % 8)
+
+
 class TensorWriter:
-    """Writes a model/task-vector as HF sharded safetensors.
+    """Writes a model/task-vector as HF sharded safetensors, streaming.
 
     Produces ``model.safetensors`` (single shard) or
     ``model-00001-of-0000N.safetensors`` + ``model.safetensors.index.json``
-    (multiple shards), byte-compatible with mergekit's ``TensorWriter``.
+    (multiple shards): the same HF layout mergekit's ``TensorWriter``
+    produces, with identical per-tensor values and offsets and a canonical
+    sorted-name header order (deterministic across runs).
+
+    Unlike a staging writer, tensor bytes are appended straight to the shard
+    file as each tensor arrives: output costs one tensor plus a bounded
+    write slice, never a staged shard nor a serialization buffer.
+
+    ``manifest`` lists ``(name, dtype_str, shape)`` for every tensor that
+    will arrive. Shard grouping follows the same greedy ``max_shard_size``
+    rule as the classic writer. Every planned tensor must arrive exactly
+    once, in manifest (sorted-name) order — merge passes all base tensors,
+    extract passes its arrival-filtered subset (see :func:`shape_fit`).
+    Violations raise loudly instead of corrupting offsets.
+
+    ``drop_caches`` releases each completed shard from the page cache
+    (see :func:`advise_drop_caches`); the output is never re-read in-run,
+    so this is always safe to enable alongside the flag.
     """
 
     def __init__(
         self,
         out_path: str,
+        manifest,
         max_shard_size: int = 1_000_000_000,
-        safe_serialization: bool = True,
-        flush_after_each: bool = False,
+        drop_caches: bool = False,
     ) -> None:
         os.makedirs(out_path, exist_ok=True)
         self.out_path = out_path
         self.max_shard_size = max_shard_size
-        self.safe_serialization = safe_serialization
-        self.flush_after_each = flush_after_each
+        self.drop_caches = drop_caches
 
+        ordered = sorted(manifest, key=lambda m: m[0])
+        # Greedy shard assignment on planned byte sizes — the same rule the
+        # staging writer applied to arriving tensors, so the layout is
+        # unchanged (arrival always follows manifest order in our callers).
+        self._shards: List[dict] = []
+        cur: list = []
+        cur_size = 0
+        for name, dtype_str, shape in ordered:
+            nbytes = 1
+            for s in shape:
+                nbytes *= s
+            nbytes *= safetensors_elem_size(dtype_str)
+            if max_shard_size > 0 and cur and cur_size + nbytes > max_shard_size:
+                self._shards.append(self._new_shard(cur))
+                cur, cur_size = [], 0
+            cur.append((name, dtype_str, tuple(shape), nbytes))
+            cur_size += nbytes
+        if cur:
+            self._shards.append(self._new_shard(cur))
+
+        self._expected = [m[0] for sh in self._shards for m in sh["members"]]
+        self._by_name = {
+            m[0]: (si, mi)
+            for si, sh in enumerate(self._shards)
+            for mi, m in enumerate(sh["members"])
+        }
+        self._arrived = 0
         self.shards_written = 0
         self.weight_map: Dict[str, str] = {}
-        self.current_shard: Dict[str, torch.Tensor] = {}
-        self.current_shard_size = 0
         self.total_size = 0
+
+    def _new_shard(self, members: list) -> dict:
+        """Precompute one shard's offsets, header bytes, and temp path."""
+        offset = 0
+        entries = []
+        for name, dtype_str, shape, nbytes in members:
+            entries.append((name, dtype_str, shape, offset, nbytes))
+            offset += nbytes
+        idx = len(self._shards)
+        return {
+            "members": members,
+            "header": _safetensors_header_bytes(entries),
+            "path": os.path.join(self.out_path, f"model-{idx + 1}.safetensors"),
+            "fh": None,
+            "arrived": 0,
+        }
 
     def __enter__(self):
         return self
@@ -438,66 +636,93 @@ class TensorWriter:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.finalize()
 
-    def save_tensor(self, name: str, tensor: torch.Tensor, clone: bool = False) -> None:
+    def save_tensor(self, name: str, tensor: torch.Tensor) -> None:
+        if self._arrived >= len(self._expected) or name != self._expected[self._arrived]:
+            raise RuntimeError(
+                f"TensorWriter: unexpected arrival {name!r} "
+                "(manifest order violated; offsets would corrupt)"
+            )
         if not tensor.is_contiguous():
             tensor = tensor.contiguous()
-        if clone:
-            tensor = tensor.clone()
 
-        tensor_size = tensor.numel() * tensor.element_size()
-        if (
-            self.current_shard
-            and self.max_shard_size > 0
-            and self.current_shard_size + tensor_size > self.max_shard_size
-        ):
-            self._flush_current_shard()
+        si, mi = self._by_name[name]
+        shard = self._shards[si]
+        nbytes = tensor.numel() * tensor.element_size()
+        planned = shard["members"][mi][3]
+        if nbytes != planned:
+            raise RuntimeError(
+                f"TensorWriter: size mismatch for {name!r} "
+                f"(got {nbytes} bytes, planned {planned})"
+            )
+        if shard["fh"] is None:
+            fh = open(shard["path"], "wb")
+            fh.write(struct.pack("<Q", len(shard["header"])))
+            fh.write(shard["header"])
+            shard["fh"] = fh
+        # Append raw bytes in bounded slices: one memcpy at a time, viewing
+        # the tensor as uint8 (no numpy bf16 issue, no full-tensor copy).
+        u8 = tensor.view(torch.uint8).reshape(-1)
+        for off in range(0, nbytes, _WRITE_SLICE_BYTES):
+            shard["fh"].write(u8[off : off + _WRITE_SLICE_BYTES].numpy().tobytes())
+        shard["arrived"] += 1
+        self._arrived += 1
+        self.total_size += nbytes
+        if shard["arrived"] == len(shard["members"]):
+            self._close_shard(si)
 
-        self.current_shard[name] = tensor
-        self.current_shard_size += tensor_size
-
-        if self.flush_after_each:
-            self._flush_current_shard()
-
-    def _flush_current_shard(self) -> None:
-        if not self.current_shard:
-            return
-        shard_data = self.current_shard
-        shard_index = self.shards_written
-        self.total_size += self.current_shard_size
-        self.current_shard = {}
-        self.current_shard_size = 0
+    def _close_shard(self, si: int) -> None:
+        """Close a completed shard file. Weight map is rebuilt in finalize."""
+        shard = self._shards[si]
+        if shard["fh"] is not None:
+            shard["fh"].close()
+            shard["fh"] = None
+        if self.drop_caches:
+            try:
+                with open(shard["path"], "rb") as f:
+                    advise_drop_caches(f.fileno(), 0, os.path.getsize(shard["path"]))
+            except OSError:
+                pass
         self.shards_written += 1
 
-        prefix, extension = self._name_components()
-        shard_name = f"{prefix}-{shard_index + 1}.{extension}"
-        shard_path = os.path.join(self.out_path, shard_name)
-        for key in shard_data:
-            self.weight_map[key] = shard_name
-        self._write_shard(shard_data, shard_path)
-
-    def _write_shard(self, shard_data: Dict[str, torch.Tensor], shard_path: str) -> None:
-        if self.safe_serialization:
-            safetensors.torch.save_file(
-                shard_data, shard_path, metadata={"format": "pt"}
-            )
-        else:
-            torch.save(shard_data, shard_path)
-
     def finalize(self) -> None:
-        self._flush_current_shard()
-
-        prefix, extension = self._name_components()
-        total_shards = self.shards_written
+        # Close any still-open shard files. A shard whose planned members did
+        # not all arrive (caller bug or aborted run) is removed instead of
+        # renamed: a gapped file would be corrupt, while absence is loud
+        # downstream. In normal runs every shard is already complete here.
+        completed: list = []
+        for shard in self._shards:
+            if shard["fh"] is not None:
+                shard["fh"].close()
+                shard["fh"] = None
+            if shard["arrived"] == len(shard["members"]):
+                completed.append(shard)
+            else:
+                logger.warning(
+                    "TensorWriter: dropping incomplete shard %s (%d/%d tensors arrived)",
+                    shard["path"],
+                    shard["arrived"],
+                    len(shard["members"]),
+                )
+                try:
+                    os.remove(shard["path"])
+                except OSError:
+                    pass
 
         # Standardize shard names to the Hugging Face format.
+        total_shards = len(completed)
         name_remap: Dict[str, str] = {}
         if total_shards == 1:
-            name_remap[f"{prefix}-1.{extension}"] = f"{prefix}.{extension}"
+            name_remap[os.path.basename(completed[0]["path"])] = "model.safetensors"
         else:
-            for idx in range(total_shards):
-                old_name = f"{prefix}-{idx + 1}.{extension}"
-                new_name = f"{prefix}-{idx + 1:05d}-of-{total_shards:05d}.{extension}"
+            for idx, shard in enumerate(completed):
+                old_name = os.path.basename(shard["path"])
+                new_name = f"model-{idx + 1:05d}-of-{total_shards:05d}.safetensors"
                 name_remap[old_name] = new_name
+
+        self.weight_map = {}
+        for shard in completed:
+            for name, _, _, _ in shard["members"]:
+                self.weight_map[name] = name_remap[os.path.basename(shard["path"])]
 
         for old_name, new_name in name_remap.items():
             old_path = os.path.join(self.out_path, old_name)
@@ -506,10 +731,7 @@ class TensorWriter:
                 os.rename(old_path, new_path)
 
         if total_shards > 1:
-            for key in self.weight_map:
-                self.weight_map[key] = name_remap.get(self.weight_map[key], self.weight_map[key])
-            index_filename = f"{prefix}.{extension}.index.json"
-            index_path = os.path.join(self.out_path, index_filename)
+            index_path = os.path.join(self.out_path, "model.safetensors.index.json")
             with open(index_path, "w", encoding="utf-8") as f:
                 json.dump(
                     {
@@ -522,11 +744,6 @@ class TensorWriter:
                     f,
                     indent=2,
                 )
-
-    def _name_components(self):
-        basename = "model" if self.safe_serialization else "pytorch_model"
-        extension = "safetensors" if self.safe_serialization else "bin"
-        return basename, extension
 
 
 # --------------------------------------------------------------------------- #

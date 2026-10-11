@@ -16,7 +16,7 @@ from .fingerprint import (
 )
 from .hf import is_repo_id, resolve_model_dir
 from .inspect import inspect_dir, verify_against_base
-from .io import ShardReader, ShardedTensorIndex, TensorWriter, load_delta
+from .io import ShardReader, ShardedTensorIndex, TensorWriter, advise_drop_caches, dtype_from_safetensors, load_delta, safetensors_dtype_str, shape_fit
 from .kernels import LinearKernel, MixtureKernel, SlerpKernel, TiesKernel
 from .merge import ModelEntry, MergeSettings, merge_model, merge_tensor
 from .merge_method import MergeKernel, MergeMethod, build_kernel
@@ -52,9 +52,13 @@ __all__ = [
     "SlerpKernel",
     "SparsificationMethod",
     "TiesKernel",
+    "advise_drop_caches",
     "build_kernel",
+    "dtype_from_safetensors",
     "load_delta",
     "ModelEntry",
+    "safetensors_dtype_str",
+    "shape_fit",
     "ShardReader",
     "ShardedTensorIndex",
     "TensorWriter",

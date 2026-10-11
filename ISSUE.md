@@ -18,64 +18,91 @@ mergekit (v0.1.4) の Task Arithmetic (GTA) マージパスの問題点：
 
 ## 2. GoatMerge の実装（完了）
 
-### 2.1 ストリーミング累加（`torch.stack` 廃止）
+### 2.1 ストリーミング蓄積（`torch.stack` 廃止）
 
 ```python
-acc = base.clone()
-for i in range(k):
-    delta = load(tv_i).clone()
-    delta = sparsify(delta)          # コンセンサス前
-    w = torch.tensor(alpha_i, dtype=delta.dtype)
-    delta.mul_(w)                    # bf16·bf16 テンソル積（parity 重要）
-    acc.add_(delta)                  # in-place
+acc = torch.zeros_like(base)
+for i, entry in enumerate(entries):
+    delta = load_delta(base, entry.dir, entry.kind, key, readers, clone=False)
+    sparsify_delta(delta, ...)     # コンセンサス前、in-place
+    delta.mul_(torch.tensor(alpha, dtype=delta.dtype))  # bf16·bf16 テンソル積
+    acc.add_(delta)                # in-place
     l1.add_(delta.abs())
-    # delta は即解放
+    # delta は即解放。テンソルあたりディスク読みは正確に 1 回
 ```
 
-- ピーク: **1.06 S**（実測、100 MB bf16、2 TV、consensus=sum）
-- 9B 級（S≈1.8GB/層）で層あたり ≈ 2–4 GB
+- ピーク: **6.14 S**（実測、`tests/measure_peak_ram.py`、100 MB bf16、
+  consensus=sum、2 TV）。設計目標 5–7 S の範囲内
+- 読みは 1 回の `readinto` でバッファを 1 つだけ確保（`bytes → bytearray →
+  clone` の 3 コピーを廃止、`io.py::_read_rows`）
+- merge 系の全 load は `clone=False`（direct リーダーは既所有ストレージを
+  返す。mmap 使用箇所はコードベースに存在しない）
 
-### 2.2 コンセンサス恒等式
+### 2.2 コンセンサス恒等式＋符号キャッシュ divisor
 
 ```
 mixed = (acc + M · l1) / 2,   M = sign(majority) = ±1
+divisor = Σ αᵢ·[signᵢ == M]    # 2 ビットパック符号キャッシュから組立
 divisor[divisor == 0] = 1
 result = (base + mixed).to(base.dtype)
 ```
 
 - 全 delta のマスク積を 2 回の in-place `add_`/`mul_` に置き換え
 - int8 符号カウンタ（count 方式）
+- divisor 用のストリーミング**2 周目を廃止**: 蓄積中に 2 ビットパック符号
+  （`_pack_signs`、k·S/4）をキャッシュし、再読・再 sparsify なしで組立
+  てる。`normalize=False` では符号キャッシュ自体を取らない
+- 副次効果: consensus merge のディスク読みが TV あたり 2 回→1 回に
+  （実測: 1 テンソル×2 TV で 6 回→4 回の row-read）
 
 ### 2.3 数値パリティ
 
 - 重み付き積 `δᵢ · αᵢ` は **bf16·bf16 テンソル積**（`stacked · weights` と一致）
 - `add_(alpha=scalar)` では内部積精度が近接要素で乖離 → 多数決符号反転
-- rtol=2e-2, atol=1e-2 で mergekit GTA と一致（43 テスト）
+  （このため §4.3 の「スカラー直接化」は**採用しない**。不変条件 #1）
+- rtol=2e-2, atol=1e-2 で mergekit GTA と一致（**97 テスト**）
 
 ### 2.4 スパルシファイ
 
-- **コンセンサス前に**各 delta へ適用
+- **コンセンサス前に**各 delta へ適用。各 delta は正確に 1 回だけ
+  sparsify される（divisor 用の再適用は §2.2 で消滅）
 - `torch.topk`（`argsort` ではなく）— インデックス k 個のみ
-- bf16/fp16 は f32 へ幅広げて topk（CPU）
-- 方式: `l1`, `l2`, `gamma`, BS（n:m ブロック）
+- 方式: `magnitude` | `random` | `magnitude_outliers` | `della_magprune` | `bs`
+- マスク計算は `chunk_elements` 未指定でも内部バジェット（8M 要素）で
+  常時チャンク化: della の int64 double-`argsort`（16 B/要素）が O(chunk)
+  に収まる。決定的手法はビット一致、確率的手法は同一 seed で決定的
+- `bernoulli` は in-place 描画（`full_like` 確率テンソルを廃止）
+- 確率的マスクの generator は `(テンソル名, ソース番号, チャンク番号)` で
+  Seeding（実行ごとの再現性を保証）
 
 ### 2.5 TV 事前抽出・再利用
 
 - `extract_task_vector`: `T = W_source − W_base` を safetensors に保存
+- 減算はインプレースでピーク 2 S、`--chunk-elements` 指定時は行チャンク
+  抽出で O(S) + O(chunk)。結果は標準パスとビット一致
 - 以降のマージは TV をストリーム（source model 再読不要）
-- 指紋検証: ベース fingerprint が一致するかチェック
+- 指紋検証: ベース fingerprint が一致するかチェック（出口コード 3 で拒否）
 
 ### 2.6 HF シャード型 safetensors I/O
 
 - `model.safetensors.index.json` + `model-XXXXX-of-NNNNN.safetensors`
 - 単一シャード → `model.safetensors`
 - 同時に 1 テンソルのみ常駐
+- **ストリーミング書き出し**: manifest からシャード分割・オフセット・
+  ヘッダを事前確定し、到着順に 64 MB スライスで追記。ステージングも
+  `save_file` バッファも持たない。ヘッダは正準ソート順で決定的
+  （`save_file` 自身のキー順序は実装定義のためバイト一致は求めない）
+- **ページキャッシュ対策**（opt-in `--drop-caches`）: 読み済み範囲・
+  書き済みシャードに `POSIX_FADV_DONTNEED` を発行。再読ペナルティは
+  ない（各テンソルは正確に 1 回読み）。実測は §2.9 参照
 
 ### 2.7 CLI + YAML レシピ
 
 - `goatmerge extract` / `goatmerge merge` / `goatmerge inspect`
 - `goatmerge merge -c recipe.yaml` で YAML からパラメータ読み込み
 - CLI フラグは YAML 値を上書き
+- `extract --chunk-elements`、`--drop-caches`（両サブコマンド、merge は
+  YAML の `drop_caches` にも対応）
 
 ### 2.8 メタデータエンベローブ
 
@@ -84,126 +111,109 @@ result = (base + mixed).to(base.dtype)
   `transformers` で読み込める
 - `inspect` で確認可能
 
-### 2.9 比較ベンチマーク（GoatMerge vs mergekit GTA）
+### 2.9 ベンチマーク・実測
 
-- 3×300 MB bf16 タスクベクトルで、ストリーミング（GoatMerge）vs stack 方式（mergekit GTA）を比較
-- 各エンジンを独立サブプロセスで実行し、`/proc/self/status` VmRSS を 5 ms 間隔でサンプリング
-- **増分メモリ**（ピーク − ベースライン）で、PyTorch ランタイム等の不可避オーバーヘッドを差し引いた純粋なマージ帰属メモリを計測
-- 結果: GoatMerge ピーク 3395 MB / 増分 3009 MB、mergekit ピーク 7289 MB / 増分 6904 MB（比 0.436）
-- 数値パリティ max|d| = 0.0625（bf16 rtol=2e-2 範囲で一致）
-- 詳細: [`Benchmarks/RESULTS.md`](Benchmarks/RESULTS.md)
+- **GoatMerge vs mergekit GTA**（[`Benchmarks/RESULTS.md`](Benchmarks/RESULTS.md)）:
+  3×300 MB bf16 タスクベクトルで増分メモリ比 **0.436**、数値パリティ
+  max|d| = 0.0625（bf16 rtol=2e-2 範囲で一致）
+- **ピーク RAM**（`tests/measure_peak_ram.py`、フィクスチャ構築と各モードを
+  子プロセス隔離で計測）: 標準パス **6.14 S**、Chunk Merge **3.21 S**
+  （100 MB bf16、consensus=sum）
+- **指紋**: アンカーの行チャンク・ストリーミングハッシュで 3.02 S → 0.62 S
+- **ページキャッシュ A/B**（Baphomet レシピ実走行、9.3 GB モデル、
+  S=1.27 GB の embed を含む）: 通常 96s・キャッシュ +17.2 GB に対し
+  `--drop-caches` で **45s・キャッシュ +2.7 GB**。プロセス peak は両方
+  2.3 GB。残余は出力シャードの writeback 中ページ（fdatasync でゼロに
+  できるが低速ディスクで約 2 倍遅くなるため速度優先で外した。
+  `io.py::_close_shard` のコメント参照）
 
-## 3. 残課題・将来展望
+## 3. 省メモリ化・高速化の改善ポイント（処理状況）
 
-| # | 課題 | 現状 | 目標 |
-|---|---|---|---|
-| 1 | 大 tensor のチャンク分割 | `--chunk-elements` あり（未実装テスト） | 400B 級を 24–48 GB GPU で実行可 |
-| 2 | 多 GPU 分配 | 未 | チャンク単位で GPU 間分配 |
-| 3 | GPU カーネル | CPU 専用 | CUDA 対応（`torch` GPU 経路） |
-| 4 | 大規模 AWA 探索 | 未 | λ/consensus/sparsify の自動探索 |
-| 6 | CABS 統合 | 未 | BS 剪定を GAT に統合（一部実装済み） |
-| 7 | 並列 TV 抽出 | 未 | k 個 TV を並列抽出 |
+§4 と違い、ここは調査で挙がった個別項目の処理ログである。
+**全項目が処理済み**（対応 or 却下）。
 
-## 4. 省メモリ化・高速化の改善ポイント（調査結果）
+### 3.1 `TensorWriter` — 全テンソルをRAMに滞留 → 対応済み
 
-コードベースを調査し、以下の改善可能性を特定した。
+- **旧現状:** `save_tensor()` が全テンソルを `current_shard`（dict）に蓄積し、
+  `save_file` がシャード全体のシリアライズバッファを確保（書き出し時に 2 S）。
+- **対応:** ストリーミング書き出し（§2.6）。12×32 MB 連続書きで 466 MB
+  （旧フロー換算 ~1.2 GB）。実モデル merge（738 テンソル、10 シャード）で
+  ヘッダ tiling・キー網羅・値を検証。
 
-### 4.1 `TensorWriter` — 全テンソルをRAMに滞留（最大影響）
+### 3.2 `SlerpKernel.finish` — float32一時テンソル → 対応済み
 
-- **現状:** `save_tensor()` が全テンソルを `current_shard`（dict）に蓄積し、
-  `max_shard_size`（5GB）を超えて初めてディスクに書き出す。
-  7Bモデル（bf16 約14GB、約400テンソル）では全テンソルが同時にRAMに存在。
-- **改善:** テンソルを小バッチ（10–20個）で分割して書き出す。
-  `max_shard_size` を小さく設定するか、`save_tensor` ごとに即座にフラッシュ。
-- **効果:** ピークRAMを ~14GB → ~1–2GB に削減。
+- 現在は base dtype のまま計算し、フルサイズ一時テンソルは `v2` 1 個のみ
+  （`kernels.py` の docstring 参照）。追加作業なし。
 
-### 4.2 `SlerpKernel.finish` — float32一時テンソル4–5個（slerp固有）
+### 3.3 `_weighted` / `accumulate` の1要素テンソル生成 → 却下（設計）
 
-- **現状:** `base.float()` / `acc.float()` / `v1/n1` / `v2/n2` で
-  bf16テンソル1個あたり float32 一時テンソル4–5個（合計 ~4x bf16サイズ）。
-- **改善:** bf16のまま計算する（最終結果は bf16 にキャストされるため精度損失なし）。
-  in-place 演算で一時テンソルを削減。
-- **効果:** slerpのピークRAMを ~4x 削減。
+- `torch.tensor(weight)` ラッパーを除去し `delta.mul_(weight)`（Python float
+  直接）にする案は、bf16·bf16 テンソル積のパリティを壊すため**採用しない**。
+  参照実装（`stacked * weights`）との内部積精度の一致が不変条件 #1。
+  微小オーバーヘッドは parity の対価として維持する。
 
-### 4.3 `_weighted` / `ConsensusAccumulator.accumulate` — 呼び出し毎に1要素テンソル生成
+### 3.4 `della_mask` — int64インデックス全サイズ割り当て → 対応済み
 
-- **現状:** `torch.tensor(weight, dtype=delta.dtype)` を毎呼び出し生成。
-  PyTorchは `delta.mul_(weight)`（Python float直接）をネイティブにサポート。
-- **改善:** `torch.tensor()` ラッパーを除去し `delta.mul_(weight)` を直接使用。
-- **効果:** 各accumulate呼び出しの微小オーバーヘッドを除去。
+- `sparsify_inplace` の既定チャンク予算（8M 要素）で常時分割。
+  行境界アライン＋同一 generator のため mask は決定的。
+  既定バジェットと明示チャンクの一致はテストで強制。
 
-### 4.4 `della_mask` — `torch.argsort` がint64インデックスを全サイズ割り当て
+### 3.5 `fingerprint.tensor_content_hash` — float32コピー → 対応済み
 
-- **現状:** `torch.argsort(magnitudes, dim=1)` で R×C × 8B（int64）× 2 の一時テンソル。
-- **改善:** チャンク分割で処理（`iter_chunks` 使用）。
-- **効果:** della_magpruneのピークRAMを ~4x 削減。
+- アンカーを行チャンクでストリーミングハッシュ（O(chunk)）。
+  ダイジェストは一括ハッシュと同一（チャンク幅・dtype を変えて検証）。
 
-### 4.5 `fingerprint.tensor_content_hash` — アンカーテンソルのfloat32コピー
+### 3.6 `magnitude_mask` / `bs_mask` — 全サイズ一時テンソル → 対応済み
 
-- **現状:** bf16/fp16アンカーテンソルを float32 に変換（2xサイズ一時テンソル）。
-- **改善:** チャンク分割でハッシュを計算（各チャンクを読み込み→ハッシュ→解放）。
-- **効果:** 指紋計算時のピークRAMを ~2x 削減。
+- §4.4 と同じ既定チャンク予算で two-pass 化。決定的手法はビット一致
+  （`test_chunked_magnitude_matches_global` 等で強制）。
 
-### 4.6 `magnitude_mask` / `bs_mask` — `_abs_flat` による全サイズフラットテンソル
+### 3.7 `bernoulli_mask` — `torch.full_like` → 対応済み
 
-- **現状:** `tensor.abs().reshape(-1)` で全サイズフラットテンソルを生成。
-  チャンク版（`magnitude_mask_chunked` / `bs_mask_chunked`）は存在するが、
-  非チャンク版では全サイズ一時テンソルが割り当てられる。
-- **改善:** 非チャンク版もチャンク分割に統一。
-- **効果:** スパルシファイのピークRAMを ~1x 削減。
+- `torch.empty` + in-place `bernoulli_` に置換。同一 seed で決定的
+  （torch CPU RNG は形状依存のため旧実装とはビット不一致になり得るが、
+  分布は同一。Chunk Merge が既に持つ性質と同類）。
 
-### 4.7 `bernoulli_mask` — `torch.full_like` による全サイズテンソル
-
-- **現状:** `torch.full_like(input=t, fill_value=density)` で全サイズテンソル生成。
-- **改善:** `torch.bernoulli_`（in-place版）を使用、またはチャンク分割。
-- **効果:** bernoulliマスクのピークRAMを ~1x 削減。
-
-### 優先度
-
-| # | 対象 | 種別 | 影響度 | 実装難度 |
-|---|------|------|--------|----------|
-| 1 | `TensorWriter` ストリーミング書き出し | 省メモリ | **大** | 中 |
-| 2 | `SlerpKernel` bf16計算 | 省メモリ+高速 | **大** | 小 |
-| 3 | `_weighted` スカラー直接 | 高速 | 小 | **最小** |
-| 4 | `della_mask` チャンク分割 | 省メモリ | 中 | 中 |
-| 5 | `fingerprint` チャンクハッシュ | 省メモリ | 中 | 中 |
-| 6 | `magnitude_mask` チャンク統一 | 省メモリ | 小 | 小 |
-| 7 | `bernoulli_mask` in-place | 省メモリ | 小 | 最小 |
-
-## 5. ファイル構成（現状）
+## 4. ファイル構成（現状）
 
 ```
 goatmerge/
-  __init__.py      # パッケージ
+  __init__.py      # パッケージ（公開 API の再エクスポート）
   cli.py            # CLI（extract/merge/inspect + YAML -c）
-  consensus.py      # ConsensusAccumulator（ストリーミングカーネル）
-  extract.py        # TV 抽出
-  fingerprint.py    # 指紋検証
+  consensus.py      # ConsensusAccumulator / GtaKernel（符号キャッシュ divisor）
+  extract.py        # TV 抽出（インプレース減算・行チャンク抽出）
+  fingerprint.py    # 指紋検証（ストリーミングアンカーハッシュ）
   hf.py             # HF モデルディレクトリ解決
   inspect.py        # モデル検査
-  io.py              # ShardReader, TensorWriter, ShardedTensorIndex
-  merge.py            # merge_model, merge_tensor
-  metadata.py         # メタデータエンベローブ
-  sparsify.py         # スパルシファイカーネル
+  io.py              # ShardReader, TensorWriter（ストリーミング）, ShardedTensorIndex
+  kernels.py         # linear / mixture / slerp / ties カーネル
+  merge.py           # merge_model, merge_tensor（Chunk Merge 含む）
+  merge_method.py    # MergeMethod / MergeKernel / build_kernel
+  metadata.py        # メタデータエンベローブ（goatmerge.json）
+  sparsify.py        # スパルシファイカーネル（既定チャンク予算付き）
 tests/
-  test_consensus_merge.py   # パリティ + マージ
+  test_consensus_merge.py   # パリティ + マージ + extract/指紋 e2e
+  test_chunk_merge.py       # Chunk Merge 等価性
+  test_kernels.py           # 各マージメソッドのカーネル
   test_fingerprint.py
-  test_io.py
+  test_io.py                # I/O + ライタ（等価性・順序違反・未完除去）
   test_metadata.py
-  test_sparsify.py
-  measure_peak_ram.py
+  test_sparsify.py          # 各方式 + 既定チャンク等価性
+  measure_peak_ram.py       # ピーク RAM 計測（標準 + Chunk 両報告）
 examples/
   merge_recipe.yaml   # YAML レシピ例
 Benchmarks/
-  benchmark_compare.py  # GoatMerge vs mergekit GTA 比較ベンチマーク
-  RESULTS.md            # ベンチマーク結果
+  benchmark_compare.py          # GoatMerge vs mergekit GTA 比較ベンチマーク
+  benchmark_task_arithmetic.py  # 実モデルでの Task Arithmetic ベンチマーク
+  RESULTS.md                    # ベンチマーク結果
 AGENTS.md             # プロジェクトガイド（gitignore）
 ambition.md           # 野心記録（gitignore）
 ```
 
-## 6. 環境
+## 5. 環境
 
 - ワークスペース: `/home/CloudGoat/llms_merge/GoatMerge`
 - インタープリタ: `/home/CloudGoat/venvs/mergekit/bin/python`
 - 依存: Python ≥ 3.10, PyTorch, `safetensors`, `pyyaml`
 - Git: `CroudGoat/GoatMerge`（private, master）
+- テスト: `pytest`（97 passed が基準）

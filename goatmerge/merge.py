@@ -1,28 +1,29 @@
 """Streaming task-arithmetic merge engine (no ``torch.stack``).
 
 Per tensor the engine streams each task vector (or source-model tensor)
-exactly once per pass:
+exactly once:
 
     acc  = sum_i alpha_i * delta_i          (in place, base dtype)
     l1   = sum_i |alpha_i * delta_i|       (in place, base dtype)
     c    = sum_i sign(alpha_i * delta_i)   (int8, count consensus only)
 
-Peak resident memory is base + acc + l1 + c + 1 delta + sparsify temp
-(~5-7 S, S = tensor bytes) instead of mergekit's (4k+4)S..(6k+7)S.
+Peak resident memory is base + acc + l1 + c + signs + 1 delta +
+sparsify temp (~5-7 S + k·S/4 sign cache in consensus mode, S = tensor
+bytes) instead of mergekit's (4k+4)S..(6k+7)S.
 
 Parity with mergekit GTA:
   - no consensus:  result = base + lambda * acc / sum(alpha_i)   (normalize)
                     (bit-exact: same sequential add order as the reference)
   - consensus:     mixed = (acc + M*l1)/2  (exact masked-sum identity),
-                    divisor recomputed in a second streamed pass.
+                    divisor built from cached per-delta signs (no re-read).
 
 Chunk Merge
     For tensors larger than ``settings.chunk_elements`` the engine switches to
     the Chunk Merge path: the tensor is processed in row chunks (load from
     disk, accumulate, write back), so peak RAM becomes O(S) + O(chunk). The
-    result is identical to the standard path — global sparsification, the
-    consensus divisor, and stochastic masks are all computed per whole tensor
-    and applied chunk by chunk.
+    result is identical to the standard path — global sparsification and
+    stochastic masks are computed per whole tensor and applied chunk by
+    chunk, and the consensus divisor needs no re-read at all.
 """
 
 from __future__ import annotations
@@ -41,6 +42,7 @@ from .io import (
     ShardedTensorIndex,
     TensorWriter,
     copy_support_files,
+    dtype_from_safetensors,
     load_delta,
     load_delta_chunk,
 )
@@ -72,6 +74,11 @@ class MergeSettings:
     consensus: ConsensusMethod = ConsensusMethod.none
     # Chunk Merge: tensors above this many elements are merged in row chunks
     chunk_elements: Optional[int] = None
+    # Page-cache hygiene: release each file range right after reading it and
+    # each written shard right after writing it (POSIX_FADV_DONTNEED). Opt-in
+    # because a consensus divisor second pass re-reads the same deltas, which
+    # then comes back from disk instead of cache.
+    drop_caches: bool = False
 
 
 @dataclass(frozen=True)
@@ -110,8 +117,8 @@ def merge_tensor(
     provided and base chunks are loaded from disk via ``get_slice``.
 
     Stochastic sparsification (``random`` / ``della_magprune``) is seeded
-    from ``(key, source index, chunk)`` so every source gets the same mask
-    in the consensus second pass as it did in the first.
+    from ``(key, source index, chunk)`` so every run reproduces the same
+    mask for the same source and chunk.
     """
     if not entries:
         if base is not None:
@@ -141,7 +148,10 @@ def merge_tensor(
         # --- Standard path (unchanged) ---
         kernel = build_kernel(base, settings)
         for i, entry in enumerate(entries):
-            delta = load_delta(base, entry.dir, entry.kind, key, readers)
+            # clone=False: the direct readers already return exclusively-owned
+            # storage (no mmap reader ever reaches this path), so the extra
+            # defensive copy is pure overhead.
+            delta = load_delta(base, entry.dir, entry.kind, key, readers, clone=False)
             if delta is None:
                 continue
             sparsify_delta(
@@ -170,7 +180,7 @@ def merge_tensor(
             base = base_reader.get_tensor(key).clone()
         kernel = build_kernel(base, settings)
         for i, entry in enumerate(entries):
-            delta = load_delta(base, entry.dir, entry.kind, key, readers)
+            delta = load_delta(base, entry.dir, entry.kind, key, readers, clone=False)
             if delta is None:
                 continue
             sparsify_delta(
@@ -194,10 +204,7 @@ def merge_tensor(
         # Get shape without loading the full tensor.
         slice_obj = base_reader.get_slice(key)
         base_shape = tuple(slice_obj.get_shape())
-        # Map dtype string to torch dtype
-        dtype_str = slice_obj.get_dtype()
-        dtype_map = {'BF16': torch.bfloat16, 'F16': torch.float16, 'F32': torch.float32, 'F64': torch.float64, 'I32': torch.int32, 'I64': torch.int64}
-        base_dtype = dtype_map.get(dtype_str, torch.bfloat16)
+        base_dtype = dtype_from_safetensors(slice_obj.get_dtype())
     else:
         base_shape = base.shape
         base_dtype = base.dtype
@@ -225,9 +232,9 @@ def merge_tensor(
 
     # Global-mask sparsification (magnitude / magnitude_outliers) is decided
     # from the whole tensor, so its parameters are scanned once per source
-    # (O(1) RAM, straight from disk) and then applied chunk by chunk — in the
-    # accumulation pass *and* in the consensus divisor pass, so both use the
-    # very same mask.
+    # (O(1) RAM, straight from disk) and then applied chunk by chunk in the
+    # accumulation pass. (The consensus divisor needs no second pass: it is
+    # built from cached signs, so a single masker instance suffices.)
     mask_params: List[dict] = []
     for entry in entries:
         reader = readers.get(entry.dir) or readers[Path(entry.dir)]
@@ -239,7 +246,8 @@ def merge_tensor(
             def _chunks(e=entry):
                 for s0, e0 in ranges:
                     chunk = load_delta_chunk(
-                        _base_rows(s0, e0), e.dir, e.kind, key, readers, s0, e0
+                        _base_rows(s0, e0), e.dir, e.kind, key, readers, s0, e0,
+                        clone=False,  # scan only reads values; see above
                     )
                     if chunk is None:
                         return
@@ -257,10 +265,7 @@ def merge_tensor(
             )
         else:
             mask_params.append({"kind": "local"})
-    # one masker for the accumulation pass, one for the divisor pass: the two
-    # passes interleave chunk by chunk, so each needs its own running budgets
     masker = GlobalMasker(mask_params)
-    masker_divisor = GlobalMasker(mask_params)
 
     for chunk_idx, (start, end) in enumerate(ranges):
         # base chunk: load from disk (no full-tensor load).
@@ -269,7 +274,8 @@ def merge_tensor(
         masker.begin_pass(chunk_idx)
         for i, entry in enumerate(entries):
             delta_chunk = load_delta_chunk(
-                base_chunk, entry.dir, entry.kind, key, readers, start, end
+                base_chunk, entry.dir, entry.kind, key, readers, start, end,
+                clone=False,  # direct-reader storage is already private
             )
             if delta_chunk is None:
                 continue
@@ -290,9 +296,9 @@ def merge_tensor(
                 )
             kernel.accumulate(delta_chunk, entry.weight)
             del delta_chunk
-        # the consensus divisor pass re-reads only this chunk's rows
+        # No divisor re-read: the kernel builds it from signs cached above.
         result_chunk = kernel.finish(
-            entries, readers, key, start=start, end=end, chunk=chunk_idx, masker=masker_divisor
+            entries, readers, key, start=start, end=end, chunk=chunk_idx
         )
         full[start:end] = result_chunk
         del result_chunk, base_chunk, kernel
@@ -318,15 +324,23 @@ def merge_model(
         raise ValueError(f"No tensors found in {base_dir}")
 
     readers: dict = {}
-    readers[Path(base_dir)] = ShardReader(base_index)
+    readers[Path(base_dir)] = ShardReader(base_index, drop_caches=settings.drop_caches)
     for entry in entries:
-        readers[Path(entry.dir)] = ShardReader(ShardedTensorIndex.from_dir(Path(entry.dir)))
+        readers[Path(entry.dir)] = ShardReader(
+            ShardedTensorIndex.from_dir(Path(entry.dir)),
+            drop_caches=settings.drop_caches,
+        )
 
     skipped: List[str] = []
-    # flush_after_each=False: tensors accumulate in the current shard and are
-    # grouped into proper HF shards (max_shard_size) at finalize(). Per-tensor
-    # flushing would emit one shard per tensor (wrong layout).
-    writer = TensorWriter(str(out_dir))
+    # The writer plans its shards upfront from the base manifest (names,
+    # dtypes, shapes — header metadata only, no tensor loads), then streams
+    # each merged tensor straight to its shard file as it arrives. Every base
+    # tensor is written exactly once, so no arrival filtering is needed.
+    manifest = []
+    for key in tensor_names:
+        sl = readers[Path(base_dir)].get_slice(key)
+        manifest.append((key, sl.get_dtype(), tuple(sl.get_shape())))
+    writer = TensorWriter(str(out_dir), manifest, drop_caches=settings.drop_caches)
     try:
         base_reader = readers[Path(base_dir)]
         for i, key in enumerate(tensor_names):
@@ -357,6 +371,8 @@ def merge_model(
         "num_tensors": len(tensor_names),
         "tensor_names": tensor_names,
         "skipped_tensors": skipped,
-        "base_fingerprint": compute_base_fingerprint(Path(base_dir)),
+        "base_fingerprint": compute_base_fingerprint(
+            Path(base_dir), drop_caches=settings.drop_caches
+        ),
         "support_files": copied,
     }
