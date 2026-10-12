@@ -107,7 +107,9 @@ def extract_task_vector(
     source_dir = Path(source_dir)
     out_dir = Path(out_dir)
 
+    logger.info("loading base index: %s", base_dir)
     base_index = ShardedTensorIndex.from_dir(base_dir)
+    logger.info("loading source index: %s", source_dir)
     src_index = ShardedTensorIndex.from_dir(source_dir)
     base_reader = ShardReader(base_index, drop_caches=drop_caches)
     src_reader = ShardReader(src_index, drop_caches=drop_caches)
@@ -130,8 +132,11 @@ def extract_task_vector(
     tensor_names: List[str] = []
     skipped: List[str] = []
 
+    keys = base_index.keys()
+    logger.info("extracting %d tensors -> %s", len(keys), out_dir)
     try:
-        for key in base_index.keys():
+        for i, key in enumerate(keys):
+            logger.info("tensor %d/%d: %s", i + 1, len(keys), key)
             if key not in src_index.tensor_paths:
                 logger.warning("skipping %s (missing in source)", key)
                 skipped.append(key)
@@ -183,6 +188,7 @@ def extract_task_vector(
     if not tensor_names:
         raise ValueError("no tensors extracted (all skipped?)")
 
+    logger.info("computing base fingerprint of %s", base_dir)
     fingerprint = compute_base_fingerprint(base_dir, drop_caches=drop_caches)
     meta = build_metadata(
         base_model=str(base_dir),
@@ -190,6 +196,12 @@ def extract_task_vector(
         base_fingerprint=fingerprint,
     )
     write_metadata(out_dir, meta)
+    logger.info(
+        "done: %d extracted, %d skipped -> %s",
+        len(tensor_names),
+        len(skipped),
+        out_dir,
+    )
 
     return {
         "tensor_names": tensor_names,

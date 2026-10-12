@@ -224,6 +224,12 @@ def merge_tensor(
     # plus O(chunk) for the per-chunk accumulators.
     full = torch.empty(base_shape, dtype=base_dtype, device="cpu")
     ranges = list(iter_chunk_ranges(n_rows, rows_per_chunk))
+    logger.info(
+        "%s: %d elements in %d row chunks (chunked merge)",
+        key,
+        n_rows * n_cols,
+        len(ranges),
+    )
 
     def _base_rows(s0: int, e0: int) -> torch.Tensor:
         if base is None:
@@ -318,6 +324,7 @@ def merge_model(
 
     Returns a summary dict (tensor count, skipped tensors, elapsed).
     """
+    logger.info("loading base index: %s", base_dir)
     base_index = ShardedTensorIndex.from_dir(Path(base_dir))
     tensor_names = base_index.keys()
     if not tensor_names:
@@ -326,6 +333,7 @@ def merge_model(
     readers: dict = {}
     readers[Path(base_dir)] = ShardReader(base_index, drop_caches=settings.drop_caches)
     for entry in entries:
+        logger.info("loading %s index: %s", entry.kind, entry.dir)
         readers[Path(entry.dir)] = ShardReader(
             ShardedTensorIndex.from_dir(Path(entry.dir)),
             drop_caches=settings.drop_caches,
@@ -343,6 +351,7 @@ def merge_model(
     writer = TensorWriter(str(out_dir), manifest, drop_caches=settings.drop_caches)
     try:
         base_reader = readers[Path(base_dir)]
+        logger.info("merging %d tensors -> %s", len(tensor_names), out_dir)
         for i, key in enumerate(tensor_names):
             # In Chunk Merge mode, don't load the full base tensor.
             # Instead, pass base=None and let merge_tensor load chunks from disk.
@@ -367,12 +376,16 @@ def merge_model(
     # files over so the output is directly loadable by transformers.
     copied = copy_support_files(base_dir, out_dir)
 
+    logger.info("computing base fingerprint of %s", base_dir)
+    fingerprint = compute_base_fingerprint(
+        Path(base_dir), drop_caches=settings.drop_caches
+    )
+    logger.info("done: wrote %d tensors -> %s", len(tensor_names), out_dir)
+
     return {
         "num_tensors": len(tensor_names),
         "tensor_names": tensor_names,
         "skipped_tensors": skipped,
-        "base_fingerprint": compute_base_fingerprint(
-            Path(base_dir), drop_caches=settings.drop_caches
-        ),
+        "base_fingerprint": fingerprint,
         "support_files": copied,
     }

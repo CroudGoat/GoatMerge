@@ -8,9 +8,11 @@ Improvements over mergekit's ``sparsify.py``:
 * All masks are ``uint8`` (1 byte/element) instead of bf16/f32.
 * Mask application and rescaling are in-place.
 * A Balanced-Sparsification (BS, n:m block) kernel is included (from CABS).
-* Chunked variants for large tensors: global magnitude pruning is done in two
-  passes with a bounded top-k candidate buffer (k values, torch memory) so the
-  per-chunk RAM is O(chunk) and no per-element Python loop is needed.
+* Chunked variants for large tensors: global magnitude pruning finds its
+  threshold by streaming exact selection (a few O(N) comparison passes, O(1)
+  RAM) instead of a top-k candidate buffer, which degrades to repeated
+  near-sorts when k is a large fraction of N. The threshold is bit-identical
+  to sorting, so chunked and whole-tensor masks agree exactly.
 
 Reference semantics:
 - magnitude: keep the top ``density`` fraction by |value|.
@@ -24,11 +26,14 @@ Reference semantics:
 
 from __future__ import annotations
 
+import logging
 import zlib
 from enum import Enum
-from typing import Iterator, List, Optional, Tuple
+from typing import Callable, Iterator, List, Optional, Tuple
 
 import torch
+
+logger = logging.getLogger("goatmerge.sparsify")
 
 
 class SparsificationMethod(str, Enum):
@@ -367,45 +372,298 @@ def _iter_abs_chunks(source) -> Iterator[torch.Tensor]:
             yield _abs_flat(chunk)
 
 
-def _topk_buffer_from(source, k: int, negate: bool = False) -> Optional[torch.Tensor]:
-    """Top-``k`` |values| of a chunk source (of ``-w`` when ``negate``).
+# --------------------------------------------------------------------------- #
+# Streaming exact selection (k-th order statistic without sorting)
+# --------------------------------------------------------------------------- #
+# Pass 1 of a global magnitude mask needs the k-th largest |value| of a tensor
+# that never materializes (chunked merge path) or dwarfs RAM (whole-tensor
+# path). Keeping the top-k candidates in a buffer costs O(k) RAM and degrades
+# to repeated near-sorts when k is a large fraction of N (e.g. density 0.3 on
+# a 600M-element embedding: a 190M-element buffer re-sorted per chunk — tens
+# of minutes for a single tensor). Instead the threshold is found by iterative
+# narrowing: each pass counts values above / equal to a pivot sampled from the
+# live window and halves the window, so a pass is O(N) cheap comparisons with
+# O(1) RAM. Pivots are always actual data values, so when the counts bracket k
+# the pivot *is* the k-th value and the result equals sorting exactly —
+# chunked and whole-tensor paths agree bit-for-bit regardless of chunking (the
+# strided sample is indexed by global flat position, so chunk boundaries do
+# not affect it).
+_SELECT_SAMPLE_TARGET = 50_000  # pivot samples per pass (strided, flat order)
+_SELECT_COLLECT_CAP = 2_000_000  # exact-finish collection bound (O(cap) RAM)
+_SELECT_MAX_ITERS = 30
 
-    A single candidate buffer of at most ``k`` elements is maintained while
-    scanning, so the scan costs one pass with O(k) scratch (torch values, not
-    Python objects) and no per-element Python loop.
+
+def _sample_window(
+    get_chunks: Callable[[], Iterator[torch.Tensor]],
+    stride: int,
+    lo: Optional[float],
+    hi: Optional[float],
+) -> Optional[torch.Tensor]:
+    """Strided sample (global flat order) of values strictly inside (lo, hi).
+
+    ``lo`` / ``hi`` of ``None`` mean unbounded. Returns ``None`` when no
+    sampled position falls inside the window.
     """
-    buf: Optional[torch.Tensor] = None
-    for w in _iter_abs_chunks(source):
-        if negate:
-            w = -w
-        take = min(k, w.numel())
-        if take <= 0:
-            continue
-        vals = torch.topk(w, take).values
-        buf = vals if buf is None else torch.cat([buf, vals])
-        if buf.numel() > k:
-            buf = torch.topk(buf, k).values
-    return buf
+    sample = []
+    pos = 0
+    for w in _iter_abs_chunks(get_chunks()):
+        flat = w.reshape(-1)
+        c = flat.numel()
+        first = (pos + stride - 1) // stride * stride - pos
+        if first < c:
+            sel = flat[first::stride]
+            if lo is not None:
+                sel = sel[sel > lo]
+            if hi is not None:
+                sel = sel[sel < hi]
+            if sel.numel():
+                sample.append(sel)
+        pos += c
+    if not sample:
+        return None
+    return torch.cat(sample)
 
 
-def _threshold_from(source, k: int) -> float:
-    """The k-th largest |value| of a chunk source (global)."""
+def _quantile_value(sample: Optional[torch.Tensor], frac: float) -> Optional[float]:
+    """Sample quantile as an actual data value (or ``None`` when empty)."""
+    if sample is None or sample.numel() == 0:
+        return None
+    s = torch.sort(sample.reshape(-1)).values
+    i = min(s.numel() - 1, max(0, int(frac * s.numel())))
+    return float(s[i])
+
+
+def _restrict(
+    sample: Optional[torch.Tensor], lo: Optional[float], hi: Optional[float]
+) -> Optional[torch.Tensor]:
+    """Values of ``sample`` strictly inside the (possibly narrowed) window."""
+    if sample is None:
+        return None
+    if lo is not None:
+        sample = sample[sample > lo]
+    if hi is not None:
+        sample = sample[sample < hi]
+    return sample if sample.numel() else None
+
+
+def _collect_window(
+    get_chunks: Callable[[], Iterator[torch.Tensor]],
+    lo: Optional[float],
+    hi: Optional[float],
+    cap: int,
+) -> Optional[Tuple[torch.Tensor, int]]:
+    """Values strictly inside (lo, hi) plus #{x <= lo} (0 when unbounded).
+
+    ``None`` when the window holds more than ``cap`` values. The decided count
+    is tallied in the same scan, so the exact-finish index never relies on
+    counts taken under older bounds.
+    """
+    out = []
+    total = 0
+    decided_lo = 0
+    for w in _iter_abs_chunks(get_chunks()):
+        if lo is not None:
+            decided_lo += int((w <= lo).sum())
+        flat = w.reshape(-1)
+        sel = flat
+        if lo is not None:
+            sel = sel[sel > lo]
+        if hi is not None:
+            sel = sel[sel < hi]
+        total += sel.numel()
+        if total > cap:
+            return None
+        if sel.numel():
+            out.append(sel)
+    if not out:
+        return None
+    return torch.cat(out), decided_lo
+
+
+def _count_and_sample(
+    get_chunks: Callable[[], Iterator[torch.Tensor]],
+    pivot: float,
+    stride: int,
+    lo: Optional[float],
+    hi: Optional[float],
+) -> Tuple[int, int, int, int, Optional[torch.Tensor]]:
+    """One streaming pass: counts vs ``pivot`` plus the window's sample.
+
+    Returns ``(outside, equal, decided_lo, decided_hi, sample)`` where
+    ``outside`` is #{x > pivot}, ``equal`` is #{x == pivot}, and the decided
+    counts are #{x <= lo} / #{x >= hi} (0 when that bound is ``None``). The
+    sample holds strided values strictly inside (lo, hi).
+    """
+    outside = 0
+    equal = 0
+    decided_lo = 0
+    decided_hi = 0
+    sample = []
+    pos = 0
+    for w in _iter_abs_chunks(get_chunks()):
+        outside += int((w > pivot).sum())
+        equal += int((w == pivot).sum())
+        if lo is not None:
+            decided_lo += int((w <= lo).sum())
+        if hi is not None:
+            decided_hi += int((w >= hi).sum())
+        flat = w.reshape(-1)
+        c = flat.numel()
+        first = (pos + stride - 1) // stride * stride - pos
+        if first < c:
+            sel = flat[first::stride]
+            if lo is not None:
+                sel = sel[sel > lo]
+            if hi is not None:
+                sel = sel[sel < hi]
+            if sel.numel():
+                sample.append(sel)
+        pos += c
+    return outside, equal, decided_lo, decided_hi, torch.cat(sample) if sample else None
+
+
+def _select_threshold(
+    get_chunks: Callable[[], Iterator[torch.Tensor]],
+    n_total: int,
+    k: int,
+) -> float:
+    """Exact k-th largest |value|, streamed.
+
+    Iterative narrowing over value space: each pass counts against a pivot and
+    halves the live window, so the scan is a few O(N) comparison passes with
+    O(1) RAM instead of a near-sort. Every pivot is an actual data value, so a
+    bracketed count proves the pivot is the k-th value; once the live window
+    is small it is collected and indexed exactly, so the returned float is
+    identical to sorting for every dtype (deterministic; independent of
+    chunking). Ranks below are 1-based ascending (the k-th largest is the
+    (n-k+1)-th smallest); the k-th smallest is served by calling with n-k+1.
+    """
     if k <= 0:
         return 0.0
-    buf = _topk_buffer_from(source, k)
-    if buf is None or buf.numel() == 0:
+    # Ascending 1-based rank of the target (k-th largest == (n-k+1)-th smallest).
+    rank = n_total - k + 1
+    stride = max(1, n_total // _SELECT_SAMPLE_TARGET)
+    lo: Optional[float] = None
+    hi: Optional[float] = None
+    pivot = _quantile_value(
+        _sample_window(get_chunks, stride, None, None),
+        (rank / n_total) if n_total else 0.5,
+    )
+    if pivot is None:  # empty input; callers clamp k, so this is defensive
         return 0.0
-    return float(buf.min())
+    verbose = n_total > 50_000_000
+    for it in range(_SELECT_MAX_ITERS):
+        outside, equal, decided_lo, decided_hi, sample = _count_and_sample(
+            get_chunks, pivot, stride, lo, hi
+        )
+        window_pop = n_total - decided_lo - decided_hi
+        if verbose:
+            logger.info(
+                "threshold select pass %d: pivot=%.6g outside=%d equal=%d window=%d",
+                it + 1,
+                pivot,
+                outside,
+                equal,
+                window_pop,
+            )
+        if outside < k <= outside + equal:
+            return pivot
+        if outside >= k:
+            lo = pivot
+            # Decided counts for the new window, derived from this pass:
+            # everything not strictly above the new lo is decided below it.
+            decided_lo = n_total - outside
+        else:
+            hi = pivot
+            decided_hi = outside + equal
+        window_pop = n_total - decided_lo - decided_hi
+        if window_pop <= _SELECT_COLLECT_CAP:
+            # Small enough to finish exactly: the target is the
+            # (rank - decided_lo)-th of the sorted window (0-based -1),
+            # since every decided-lo value is strictly below it.
+            # The decided count is re-tallied in the collection scan itself.
+            got = _collect_window(get_chunks, lo, hi, _SELECT_COLLECT_CAP)
+            if got is not None:
+                vals, fresh_lo = got
+                s = torch.sort(vals.reshape(-1)).values
+                return float(s[rank - fresh_lo - 1])
+        # Next pivot targets the target's rank inside the window, so even
+        # continuous (tie-free) values converge in a couple of passes. The
+        # sample was taken under the old bounds; restricting it to the new
+        # window is exactly the new window's strided sample.
+        frac = (rank - decided_lo) / window_pop if window_pop > 0 else 0.5
+        pivot = _quantile_value(_restrict(sample, lo, hi), frac)
+        if pivot is None:
+            # Window holds no sampled value (collapsed past float resolution
+            # or sparser than the stride): sample denser until a value shows.
+            # The remaining population is tiny here, so this terminates fast.
+            sub = stride // 16
+            while pivot is None and sub >= 1:
+                pivot = _quantile_value(
+                    _sample_window(get_chunks, sub, lo, hi), 0.5
+                )
+                sub //= 16
+            if pivot is None:  # empty window; cannot happen, bail out safely
+                break
+    logger.warning(
+        "threshold selection did not converge (n=%d, k=%d); results may differ",
+        n_total,
+        k,
+    )
+    return pivot
 
 
-def _bottom_threshold_from(source, k: int) -> float:
-    """The k-th smallest |value| of a chunk source (global)."""
+def _as_chunk_factory(source) -> Tuple[Callable[[], Iterator[torch.Tensor]], int]:
+    """A fresh chunk iterable factory plus element count for a scan source.
+
+    ``source`` is a tensor (re-scanned in bounded chunks) or a zero-arg
+    callable returning a fresh chunk iterable (with the count attached).
+    """
+    if isinstance(source, torch.Tensor):
+        return (lambda: _iter_abs_chunks(source)), source.numel()
+    if callable(source):
+        raise ValueError("a callable scan source needs an explicit n_total")
+    raise TypeError(f"unsupported scan source: {type(source)}")
+
+
+def _threshold_from(source, k: int, n_total: Optional[int] = None) -> float:
+    """The k-th largest |value| of a chunk source (global).
+
+    ``source`` is a tensor or a zero-arg callable returning a fresh chunk
+    iterable (which needs ``n_total``). Found by streaming selection, exact.
+    """
+    if isinstance(source, torch.Tensor):
+        factory, n = _as_chunk_factory(source)
+    elif callable(source):
+        if n_total is None:
+            raise ValueError("callable scan source needs n_total")
+        factory, n = source, n_total
+    else:
+        raise TypeError(f"unsupported scan source: {type(source)}")
+    k = max(0, min(n, k))
     if k <= 0:
         return 0.0
-    buf = _topk_buffer_from(source, k, negate=True)
-    if buf is None or buf.numel() == 0:
+    return _select_threshold(factory, n, k)
+
+
+def _bottom_threshold_from(source, k: int, n_total: Optional[int] = None) -> float:
+    """The k-th smallest |value| of a chunk source (global).
+
+    The k-th smallest is the (n-k+1)-th largest, so this shares the
+    largest-only selection above.
+    """
+    if isinstance(source, torch.Tensor):
+        factory, n = _as_chunk_factory(source)
+    elif callable(source):
+        if n_total is None:
+            raise ValueError("callable scan source needs n_total")
+        factory, n = source, n_total
+    else:
+        raise TypeError(f"unsupported scan source: {type(source)}")
+    k = max(0, min(n, k))
+    if k <= 0:
         return 0.0
-    return -float(buf.min())
+    return _select_threshold(factory, n, n - k + 1)
 
 
 def _count_from(source, op: str, thr: float) -> int:
@@ -638,8 +896,14 @@ def _magnitude_params(source_factory, n_total: int, density: float, rescale: boo
     k = max(0, min(n_total, k))
     if k == 0:
         return {"kind": "empty"}
-    thr = _threshold_from(source_factory(), k)
+    logger.info(
+        "global magnitude mask: top %d of %d elements, scanning threshold...",
+        k,
+        n_total,
+    )
+    thr = _threshold_from(source_factory, k, n_total)
     tie_budget = k - _count_from(source_factory(), ">", thr)
+    logger.info("global magnitude mask: threshold=%.6g, filling mask", thr)
     params = {"kind": "magnitude", "thr": thr, "ties": tie_budget}
     if rescale:
         before = after = 0.0
@@ -666,8 +930,19 @@ def _outliers_params(source_factory, n_total: int, density: float, gamma: float,
         n_bot = 0
     n_top = max(0, min(n_total, n_top))
     n_bot = max(0, min(n_total, n_bot))
-    top_thr = _threshold_from(source_factory(), n_top) if n_top > 0 else 0.0
-    bot_thr = _bottom_threshold_from(source_factory(), n_bot) if n_bot > 0 else 0.0
+    logger.info(
+        "global outliers mask: top %d / bottom %d of %d elements, scanning...",
+        n_top,
+        n_bot,
+        n_total,
+    )
+    top_thr = _threshold_from(source_factory, n_top, n_total) if n_top > 0 else 0.0
+    bot_thr = _bottom_threshold_from(source_factory, n_bot, n_total) if n_bot > 0 else 0.0
+    logger.info(
+        "global outliers mask: top_thr=%.6g bot_thr=%.6g, filling mask",
+        top_thr,
+        bot_thr,
+    )
     params = {
         "kind": "outliers",
         "has_top": n_top > 0,

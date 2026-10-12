@@ -30,6 +30,8 @@ from .merge_method import MergeMethod
 from .metadata import build_merged_metadata, write_metadata
 from .sparsify import SparsificationMethod
 
+logger = logging.getLogger("goatmerge.cli")
+
 
 def _parse_entry(spec: str) -> ModelEntry:
     """Parse ``DIR:WEIGHT`` (last colon separates the weight)."""
@@ -171,6 +173,10 @@ def cmd_merge(args) -> int:
     if tv_dirs and not skip_fp:
         from .fingerprint import compute_base_fingerprint
 
+        logger.info(
+            "verifying base fingerprint against %d task vector(s)...",
+            len(tv_dirs),
+        )
         mismatches = verify_against_base(base, tv_dirs, drop_caches=settings.drop_caches)
         if mismatches:
             print(
