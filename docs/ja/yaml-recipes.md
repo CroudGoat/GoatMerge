@@ -1,12 +1,13 @@
 # YAML レシピ
 
 `-c recipe.yaml` を渡すと、複数のパラメータをファイルで管理できる。
-CLI フラグは YAML の値を上書きするので、レシピを雛形にして 1 つだけ
-コマンドラインで変更する、といった使い方もできる。
+CLI フラグは YAML の値を上書きする。
+このためレシピを雛形にし、1 項目だけコマンドラインで変える使い方もできる。
 
-解決順序は **CLI → YAML → 既定値**。`base` / `out` は CLI → YAML の順に解決（必須）。
-`tv` / `model` は CLI 指定があれば CLI、なければ YAML。各エントリは文字列 `DIR`
-または `{dir, weight}`（weight 既定 1.0）。
+解決順序は CLI、YAML、既定値の順である。
+`base` と `out` は CLI から YAML の順に解決し、どちらも必須である。
+`tv` と `model` は CLI 指定があれば CLI を、なければ YAML を使う。
+各エントリは文字列 `DIR` か `{dir, weight}` であり、weight の既定値は 1.0 である。
 
 ## 最小構成
 
@@ -48,22 +49,21 @@ n: 64                              # --n
 m: 256                             # --m
 gamma: 0.0                         # --gamma
 epsilon: 0.0                       # --epsilon
-no_rescale: false                  # true にするとノーム再正規化をオフ
-no_normalize: false                # true にすると除数正規化をオフ
+no_rescale: false                  # true にするとノーム再正規化を無効にする
+no_normalize: false                # true にすると除数正規化を無効にする
 lambda: 1.0                        # --lambda
 
 # --- 大テンソル ---
 chunk_elements: null               # --chunk-elements
 
 # --- 指紋照合 ---
-skip_fingerprint_check: false      # true にすると照合をスキップ
+skip_fingerprint_check: false      # true にすると照合をスキップする
 
 # --- ページキャッシュ対策（merge のみ） ---
-drop_caches: false                 # true = 読み書き後に POSIX_FADV_DONTNEED
+drop_caches: false                 # true = 読み書き後に POSIX_FADV_DONTNEED を発行する
 ```
 
-同梱の例は `examples/merge_recipe.yaml`。その他の YAML キーは CLI オプション名と
-1:1 に対応する（`lambda`、`no_rescale`、`no_normalize`、`chunk_elements`、
-`skip_fingerprint_check`、`drop_caches`）。
-
-注意：`extract` に YAML モードはない。上記キーはすべて `merge` 用だ。
+同梱の例は `examples/merge_recipe.yaml` である。
+その他の YAML キーは CLI オプション名と 1 対 1 に対応する（`lambda`、`no_rescale`、`no_normalize`、`chunk_elements`、`skip_fingerprint_check`、`drop_caches`）。
+`extract` に YAML モードはない。
+上記のキーはすべて `merge` 用である。
