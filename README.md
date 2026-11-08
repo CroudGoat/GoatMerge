@@ -1,7 +1,5 @@
 # GoatMerge
 
-![GoatMerge](GoatMerge.png)
-
 [日本語版はこちら](README-ja.md)
 
 **GoatMerge** is a *streaming* task-arithmetic merge engine. It merges
