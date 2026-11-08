@@ -1,6 +1,8 @@
 # GoatMerge
 
-![GoatMerge](GoatMerge.png)
+<p align="center">
+  <img src="mergeguy.png" alt="GoatMerge ロゴ" width="220">
+</p>
 
 [English](README.md)
 

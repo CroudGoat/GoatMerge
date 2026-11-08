@@ -1,5 +1,9 @@
 # GoatMerge
 
+<p align="center">
+  <img src="mergeguy.png" alt="GoatMerge logo" width="220">
+</p>
+
 [日本語版はこちら](README-ja.md)
 
 **GoatMerge** is a *streaming* task-arithmetic merge engine. It merges
